@@ -1,0 +1,75 @@
+{
+  "name": "nitori-codex-webview",
+  "displayName": "Nitori Codex Webview",
+  "description": "A lightweight Webview chat UI that talks to the local Codex app-server, with a customizable avatar.",
+  "version": "0.0.6",
+  "publisher": "local",
+  "private": true,
+  "engines": {
+    "vscode": "^1.109.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "scripts": {
+    "build": "node ./scripts/build.mjs",
+    "watch": "node ./scripts/build.mjs --watch",
+    "package": "npm run build"
+  },
+  "activationEvents": [
+    "onCommand:nitoriCodex.open",
+    "onView:nitoriCodex.sidebarView"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "nitoriCodex.open",
+        "title": "Nitori: Open Codex Webview"
+      }
+    ],
+    "configuration": {
+      "title": "Nitori Codex",
+      "properties": {
+        "nitoriCodex.codexPath": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "description": "Path to the Codex CLI executable. If not set, the extension tries to auto-detect it, otherwise falls back to 'codex' in PATH."
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "nitoriCodexViewContainer",
+          "title": "Nitori",
+          "icon": "resources/nitori.svg"
+        }
+      ]
+    },
+    "views": {
+      "nitoriCodexViewContainer": [
+        {
+          "id": "nitoriCodex.sidebarView",
+          "type": "webview",
+          "name": "Nitori Codex"
+        }
+      ]
+    }
+  },
+  "keywords": [],
+  "author": "",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@vscode/webview-ui-toolkit": "^1.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.3",
+    "@types/vscode": "^1.109.0",
+    "esbuild": "^0.27.3",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,15 @@
+**/.vscode/**
+**/node_modules/**
+**/src/**
+**/scripts/**
+**/tmp-proto/**
+**/*.ts
+**/*.map
+
+# Keep runtime assets
+!dist/**
+!media/**
+!resources/**
+!package.json
+!README.md
+!README.ja.md
