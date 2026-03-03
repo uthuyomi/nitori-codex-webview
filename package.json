@@ -2,7 +2,7 @@
   "name": "nitori-codex-webview",
   "displayName": "Nitori Codex Webview",
   "description": "A lightweight Webview chat UI that talks to the local Codex app-server, with a customizable avatar.",
-  "version": "0.0.6",
+  "version": "0.0.30",
   "publisher": "local",
   "private": true,
   "engines": {
@@ -38,6 +38,11 @@
           ],
           "default": null,
           "description": "Path to the Codex CLI executable. If not set, the extension tries to auto-detect it, otherwise falls back to 'codex' in PATH."
+        },
+        "nitoriCodex.verboseEvents": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show verbose internal events (tool calls, web search results, unknown items) in the chat as system messages. Can be noisy and slow."
         }
       }
     },
@@ -64,7 +69,10 @@
   "author": "",
   "license": "UNLICENSED",
   "dependencies": {
-    "@vscode/webview-ui-toolkit": "^1.4.0"
+    "@shikijs/transformers": "^3.12.2",
+    "@vscode/webview-ui-toolkit": "^1.4.0",
+    "markdown-it": "^14.1.0",
+    "shiki": "^3.12.2"
   },
   "devDependencies": {
     "@types/node": "^25.2.3",

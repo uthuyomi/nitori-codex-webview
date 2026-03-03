@@ -1,0 +1,14 @@
+# Dependencies
+node_modules/
+
+# Build artifacts (keep dist output, but ignore maps)
+dist/*.map
+
+# Local/test scratch files
+tmp-*/
+tmp-*.mjs
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.vscode/

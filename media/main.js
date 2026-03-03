@@ -29,6 +29,10 @@
   const fullAccessLabel = document.getElementById("fullAccessLabel");
   const toggleApproval = document.getElementById("toggleApproval");
   const approvalLabel = document.getElementById("approvalLabel");
+  const activityIndicator = document.getElementById("activityIndicator");
+  const activityKind = document.getElementById("activityKind");
+  const activityCwd = document.getElementById("activityCwd");
+  const activityDetail = document.getElementById("activityDetail");
   const rateFooter = document.getElementById("rateFooter");
   const sendIconUse = document.getElementById("sendIconUse");
 
@@ -45,14 +49,273 @@
   let state = null;
   let lastRendered = { threadId: null, updatedAt: null };
   let attachments = [];
+  const previewByPath = new Map(); // path -> dataUrl|null
+  const previewReqById = new Map(); // requestId -> path
+  const previewPendingByPath = new Set();
+  let previewSeq = 1;
   let isBusy = false;
+  // `turnBusy` from the extension is the source of truth for whether work is still running.
+  // Without this, there are small gaps where pending counts hit 0 and we briefly clear busy,
+  // causing the activity indicator to flash.
+  let serverBusy = false;
+  // Don't surface "busy/thinking" UI until the user actually sends a message in this webview
+  // (or we see real streaming activity). This avoids showing "思考中" just by opening the view.
+  let allowBusyUI = false;
+  let pendingSend = false;
+  let pendingAssistantItems = 0;
+  let pendingCommandItems = 0;
+  let pendingFileItems = 0;
+  let clearBusyToken = 0;
   let taskQuery = "";
+  let activeCommand = null;
+  let activeFileChange = null;
+  let stickyActivity = null; // { kind, kindLabel, detailText, untilMs }
+  let lastActivityKey = "";
   let persisted = vscode.getState() || {};
   let draftsByThreadId =
     persisted && typeof persisted === "object" && persisted.draftsByThreadId && typeof persisted.draftsByThreadId === "object"
       ? persisted.draftsByThreadId
       : {};
   let draftSaveTimer = null;
+  let shikiStyleEl = null;
+  const cspNonce = (() => {
+    try {
+      const s = document.querySelector("script[nonce]");
+      return s && s.nonce ? String(s.nonce) : "";
+    } catch {
+      return "";
+    }
+  })();
+
+  function baseName(p) {
+    return String(p || "").split(/[\\/]/).pop() || String(p || "");
+  }
+
+  function renderTextWithLinks(el, text) {
+    if (!el) return;
+    const raw = String(text || "");
+    const maxLinkifyChars = 40000;
+    if (raw.length > maxLinkifyChars) {
+      el.textContent = raw;
+      return;
+    }
+
+    // Match (in order): markdown link, autolink, url, windows path, posix/relative path+ext, filename+ext.
+    const re =
+      /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|<\s*(https?:\/\/[^>\s]+)\s*>|(https?:\/\/[^\s<>()]+)|\b([A-Za-z]:\\[^\s:*?"<>|]+(?:\\[^\s:*?"<>|]+)*)(?::(\d+))?(?::(\d+))?|(?:(\.\.?[\\/])?[\w@.-]+(?:[\\/][\w@.-]+)+\.[A-Za-z0-9]{1,6})(?:(?::(\d+))?(?::(\d+))?)|\b([\w@.-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|jsonc|md|txt|css|scss|html|yml|yaml|toml|png|jpg|jpeg|gif|webp|bmp|vsix))(?::(\d+))?(?::(\d+))?|\b((?:\.\.?[\\/])?[\w@.-]+(?:[\\/][\w@.-]+)*\.[A-Za-z0-9]{1,6})#L(\d+)(?:C(\d+))?/g;
+
+    const frag = document.createDocumentFragment();
+    let last = 0;
+
+    function appendText(s) {
+      if (!s) return;
+      frag.appendChild(document.createTextNode(s));
+    }
+
+    function trimTrailingPunct(u) {
+      // Common trailing punctuation in prose; don't strip ')', since URLs can legitimately contain it.
+      return String(u || "").replace(/[\],.;:!?]+$/g, "");
+    }
+
+    function makeLink(label, kind, payload) {
+      const a = document.createElement("a");
+      a.className = "codex-link";
+      a.href = "#";
+      a.textContent = label;
+      a.onclick = (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (kind === "external") vscode.postMessage({ type: "openExternal", url: payload.url });
+        else if (kind === "file") vscode.postMessage(payload);
+      };
+      return a;
+    }
+
+    let m;
+    while ((m = re.exec(raw))) {
+      const start = m.index;
+      const end = re.lastIndex;
+      appendText(raw.slice(last, start));
+
+      // Markdown link: [label](url)
+      if (m[1] && m[2]) {
+        frag.appendChild(makeLink(m[1], "external", { url: m[2] }));
+        last = end;
+        continue;
+      }
+
+      // Autolink: <https://...>
+      if (m[3]) {
+        const url = trimTrailingPunct(m[3]);
+        frag.appendChild(makeLink(url, "external", { url }));
+        last = end;
+        continue;
+      }
+
+      // Raw URL
+      if (m[4]) {
+        const url = trimTrailingPunct(m[4]);
+        frag.appendChild(makeLink(url, "external", { url }));
+        last = end;
+        continue;
+      }
+
+      // Windows absolute path with optional :line:col
+      if (m[5]) {
+        const p = m[5];
+        const line = m[6] ? Number(m[6]) : undefined;
+        const column = m[7] ? Number(m[7]) : undefined;
+        frag.appendChild(makeLink(m[0], "file", { type: "openFileAt", path: p, line, column }));
+        last = end;
+        continue;
+      }
+
+      // Relative/posix path with extension + optional :line:col
+      if (m[8]) {
+        const p = m[8];
+        const line = m[9] ? Number(m[9]) : undefined;
+        const column = m[10] ? Number(m[10]) : undefined;
+        frag.appendChild(makeLink(m[0], "file", { type: "openFileAt", path: p, line, column }));
+        last = end;
+        continue;
+      }
+
+      // Filename with extension + optional :line:col
+      if (m[11]) {
+        const p = m[11];
+        const line = m[12] ? Number(m[12]) : undefined;
+        const column = m[13] ? Number(m[13]) : undefined;
+        frag.appendChild(makeLink(m[0], "file", { type: "openFileAt", path: p, line, column }));
+        last = end;
+        continue;
+      }
+
+      // path#LlineCcol
+      if (m[14]) {
+        const p = m[14];
+        const line = m[15] ? Number(m[15]) : undefined;
+        const column = m[16] ? Number(m[16]) : undefined;
+        frag.appendChild(makeLink(m[0], "file", { type: "openFileAt", path: p, line, column }));
+        last = end;
+        continue;
+      }
+
+      appendText(raw.slice(start, end));
+      last = end;
+    }
+
+    appendText(raw.slice(last));
+    el.textContent = "";
+    el.appendChild(frag);
+  }
+
+  function linkifyDom(rootEl) {
+    if (!rootEl) return;
+    const root = rootEl;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode: (n) => {
+        if (!n || !n.parentElement) return NodeFilter.FILTER_REJECT;
+        const p = n.parentElement;
+        if (p.closest("a, pre, code, textarea, input")) return NodeFilter.FILTER_REJECT;
+        const s = String(n.nodeValue || "");
+        if (!s.trim()) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    const nodes = [];
+    let cur = walker.nextNode();
+    while (cur) {
+      nodes.push(cur);
+      cur = walker.nextNode();
+    }
+    for (const n of nodes) {
+      const span = document.createElement("span");
+      renderTextWithLinks(span, n.nodeValue || "");
+      n.parentNode.replaceChild(span, n);
+    }
+  }
+
+  function renderHtmlInto(el, html) {
+    if (!el) return;
+    el.innerHTML = String(html || "");
+    linkifyDom(el);
+  }
+
+  function isImagePath(p) {
+    const ext = String(p || "").trim().toLowerCase().split(".").pop() || "";
+    return ext === "png" || ext === "jpg" || ext === "jpeg" || ext === "gif" || ext === "webp" || ext === "bmp";
+  }
+
+  function addAttachmentPath(p) {
+    const path = String(p || "").trim();
+    if (!path) return;
+    if (!attachments.includes(path)) {
+      attachments = attachments.concat([path]);
+      renderAttachments();
+      schedulePersistDraft();
+    }
+  }
+
+  function arrayBufferToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    const chunk = 0x8000;
+    let binary = "";
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+  }
+
+  async function uploadFileObject(file) {
+    if (!file) return;
+    const maxBytes = 6 * 1024 * 1024;
+    if (typeof file.size === "number" && file.size > maxBytes) {
+      addSystemMessage(`添付が大きすぎます（最大 ${maxBytes} bytes）: ${file.name || "file"}`);
+      return;
+    }
+    try {
+      const buf = await file.arrayBuffer();
+      const dataBase64 = arrayBufferToBase64(buf);
+      vscode.postMessage({
+        type: "uploadFiles",
+        files: [{ name: file.name || "file", mime: file.type || "", dataBase64 }]
+      });
+    } catch {
+      addSystemMessage(`添付の読み込みに失敗しました: ${file.name || "file"}`);
+    }
+  }
+
+  function requestPreviewForPath(p) {
+    const path = String(p || "").trim();
+    if (!path) return;
+    if (!isImagePath(path)) return;
+    if (previewByPath.has(path)) return;
+    if (previewPendingByPath.has(path)) return;
+    const requestId = previewSeq++;
+    previewPendingByPath.add(path);
+    previewReqById.set(requestId, path);
+    vscode.postMessage({ type: "getFilePreview", requestId, path });
+  }
+
+  function applyPreview(path, dataUrl) {
+    const p = String(path || "");
+    previewPendingByPath.delete(p);
+    previewByPath.set(p, typeof dataUrl === "string" && dataUrl ? dataUrl : null);
+    const imgs = document.querySelectorAll('img[data-preview-path]');
+    for (const img of imgs) {
+      if (!img || !img.dataset) continue;
+      if (img.dataset.previewPath !== p) continue;
+      if (previewByPath.get(p)) {
+        img.src = previewByPath.get(p);
+        img.classList.remove("is-loading");
+        img.removeAttribute("aria-busy");
+      } else {
+        img.classList.add("is-missing");
+        img.classList.remove("is-loading");
+        img.removeAttribute("aria-busy");
+      }
+    }
+  }
 
   function persistWebviewState() {
     persisted = Object.assign({}, persisted, { draftsByThreadId });
@@ -204,10 +467,34 @@
       const chip = document.createElement("div");
       chip.className = "chip";
 
-      const text = document.createElement("div");
-      text.className = "chip-text";
-      text.textContent = String(p).split(/[\\\\/]/).pop();
-      chip.appendChild(text);
+      const path = String(p || "");
+      const imgKind = isImagePath(path);
+      if (imgKind) {
+        requestPreviewForPath(path);
+        const thumb = document.createElement("img");
+        thumb.className = "chip-thumb is-loading";
+        thumb.alt = "image";
+        thumb.dataset.previewPath = path;
+        thumb.setAttribute("aria-busy", "true");
+        const cached = previewByPath.get(path);
+        if (cached) {
+          thumb.src = cached;
+          thumb.classList.remove("is-loading");
+          thumb.removeAttribute("aria-busy");
+        } else if (previewByPath.has(path)) {
+          thumb.classList.add("is-missing");
+          thumb.classList.remove("is-loading");
+          thumb.removeAttribute("aria-busy");
+        }
+        chip.appendChild(thumb);
+      }
+
+      if (!imgKind) {
+        const text = document.createElement("div");
+        text.className = "chip-text";
+        text.textContent = baseName(path);
+        chip.appendChild(text);
+      }
 
       const x = document.createElement("button");
       x.className = "chip-x";
@@ -227,8 +514,31 @@
     chat.scrollTop = chat.scrollHeight;
   }
 
+  function scheduleMaybeClearBusy() {
+    const token = ++clearBusyToken;
+    setTimeout(() => {
+      if (token !== clearBusyToken) return;
+      if (!isBusy) return;
+      if (serverBusy) return;
+      if (pendingSend) return;
+      if (pendingAssistantItems || pendingCommandItems || pendingFileItems) return;
+      if (activeCommand || activeFileChange) return;
+      setBusy(false);
+    }, 250);
+  }
+
   function setBusy(busy) {
     isBusy = Boolean(busy);
+    if (!isBusy) {
+      activeCommand = null;
+      activeFileChange = null;
+      stickyActivity = null;
+      pendingSend = false;
+      pendingAssistantItems = 0;
+      pendingCommandItems = 0;
+      pendingFileItems = 0;
+      clearBusyToken++;
+    }
     if (send) {
       send.classList.toggle("is-busy", isBusy);
       send.title = isBusy ? "Stop" : "Send";
@@ -237,6 +547,56 @@
     if (sendIconUse) {
       sendIconUse.setAttribute("href", isBusy ? "#ico-stop" : "#ico-up");
     }
+    renderActivityIndicator();
+  }
+
+  function renderActivityIndicator() {
+    if (!activityIndicator) return;
+
+    // Only show while the Send button is in "Stop" mode (turn busy).
+    if (!isBusy) {
+      activityIndicator.hidden = true;
+      activityIndicator.classList.remove("is-active");
+      lastActivityKey = "";
+      return;
+    }
+
+    const cwd = state && state.cwd ? String(state.cwd) : "";
+    const now = Date.now();
+
+    let kind = "thinking";
+    let kindLabel = "思考中";
+    let detailText = "";
+
+    if (activeFileChange) {
+      kind = "file";
+      kindLabel = "ファイル編集中";
+    } else if (activeCommand) {
+      kind = "command";
+      kindLabel = "コマンド執行中";
+    } else if (stickyActivity && typeof stickyActivity.untilMs === "number" && stickyActivity.untilMs > now) {
+      // Keep the last non-thinking activity visible briefly so it doesn't just flash.
+      kind = stickyActivity.kind || kind;
+      kindLabel = stickyActivity.kindLabel || kindLabel;
+      detailText = stickyActivity.detailText || detailText;
+    }
+
+    // Refresh stickiness while command/file is active; also keep it briefly after completion.
+    if (kind !== "thinking") {
+      stickyActivity = { kind, kindLabel, detailText, untilMs: now + 1500 };
+    }
+
+    const key = `${kind}\n${cwd}\n${detailText}`;
+    if (key === lastActivityKey && !activityIndicator.hidden) return;
+    lastActivityKey = key;
+
+    activityIndicator.hidden = false;
+    activityIndicator.classList.add("is-active");
+    activityIndicator.dataset.kind = kind;
+
+    if (activityKind) activityKind.textContent = kindLabel;
+    if (activityCwd) activityCwd.textContent = cwd || "(no workspace folder)";
+    if (activityDetail) activityDetail.textContent = detailText ? ` · ${detailText}` : "";
   }
 
   function addRowFromTemplate(tpl) {
@@ -249,7 +609,93 @@
 
   function addUserMessage(text) {
     const row = addRowFromTemplate(tplUser);
-    row.querySelector(".bubble").textContent = text;
+    const bubble = row.querySelector(".bubble");
+    bubble.textContent = "";
+
+    const msgText = String(text || "");
+    if (msgText.trim()) {
+      const t = document.createElement("div");
+      t.className = "msg-text";
+      renderTextWithLinks(t, msgText);
+      bubble.appendChild(t);
+    }
+
+    const a = arguments.length >= 2 ? arguments[1] : null;
+    const list = Array.isArray(a) ? a : [];
+    if (list.length) {
+      const wrap = document.createElement("div");
+      wrap.className = "attachments attachments-msg";
+
+      for (const raw of list) {
+        const path = typeof raw === "string" ? raw : raw && typeof raw.path === "string" ? raw.path : "";
+        const url = raw && typeof raw === "object" && typeof raw.url === "string" ? raw.url : "";
+
+        const chip = document.createElement("div");
+        chip.className = "chip chip-msg";
+
+        const isLocal = Boolean(path);
+        const isImg = url ? true : isImagePath(path);
+        if (isImg) {
+          const img = document.createElement("img");
+          img.className = "chip-thumb chip-thumb-msg";
+          img.alt = "image";
+          if (url) {
+            img.src = url;
+          } else {
+            requestPreviewForPath(path);
+            img.dataset.previewPath = path;
+            const cached = previewByPath.get(path);
+            if (cached) img.src = cached;
+            else if (previewByPath.has(path)) {
+              img.classList.add("is-missing");
+            } else {
+              img.classList.add("is-loading");
+              img.setAttribute("aria-busy", "true");
+            }
+          }
+          chip.appendChild(img);
+        }
+
+        if (!isImg) {
+          const name = raw && typeof raw === "object" && typeof raw.name === "string" ? raw.name : baseName(path);
+          const t = document.createElement("div");
+          t.className = "chip-text";
+          t.textContent = name;
+          chip.appendChild(t);
+        }
+
+        if (isLocal) {
+          const openBtn = document.createElement("button");
+          openBtn.className = "chip-act";
+          openBtn.textContent = "開く";
+          openBtn.title = "VS Codeで開く";
+          openBtn.onclick = (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            vscode.postMessage({ type: "openLocalFile", path });
+          };
+          chip.appendChild(openBtn);
+
+          const reBtn = document.createElement("button");
+          reBtn.className = "chip-act";
+          reBtn.textContent = "再添付";
+          reBtn.title = "このファイルを入力欄に再添付";
+          reBtn.onclick = (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            if (!attachments.includes(path)) {
+              attachments = attachments.concat([path]);
+              renderAttachments();
+              schedulePersistDraft();
+            }
+          };
+          chip.appendChild(reBtn);
+        }
+
+        wrap.appendChild(chip);
+      }
+      bubble.appendChild(wrap);
+    }
   }
 
   function looksLikeEscapedDocument(text) {
@@ -279,7 +725,7 @@
 
   function addSystemMessage(text) {
     const row = addRowFromTemplate(tplSystem);
-    row.querySelector(".bubble").textContent = text;
+    renderTextWithLinks(row.querySelector(".bubble"), text);
   }
 
   function clampPreview(s, maxLen) {
@@ -517,7 +963,22 @@
       title.className = "fold-title";
       const kind = String(c && c.kind ? c.kind : "");
       const filePath = String(c && c.path ? c.path : "");
-      title.textContent = `${kind ? kind + " " : ""}${filePath || "(unknown)"}`;
+      title.textContent = "";
+      if (kind) title.appendChild(document.createTextNode(kind + " "));
+      if (filePath) {
+        const a = document.createElement("a");
+        a.className = "codex-link";
+        a.href = "#";
+        a.textContent = filePath;
+        a.onclick = (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          vscode.postMessage({ type: "openFileAt", path: filePath });
+        };
+        title.appendChild(a);
+      } else {
+        title.appendChild(document.createTextNode("(unknown)"));
+      }
       left.appendChild(title);
 
       const right = document.createElement("div");
@@ -615,6 +1076,26 @@
     return parts.join("\n");
   }
 
+  function parseUserContent(content) {
+    const textParts = [];
+    const atts = [];
+    if (!Array.isArray(content)) return { text: "", attachments: [] };
+    for (const c of content) {
+      if (!c || typeof c !== "object") continue;
+      const t = String(c.type || "");
+      if (t === "text" && typeof c.text === "string") textParts.push(c.text);
+      else if (t === "mention" && typeof c.path === "string") {
+        atts.push({ path: c.path, name: typeof c.name === "string" ? c.name : baseName(c.path) });
+      } else if ((t === "localImage" || t === "local_image") && typeof c.path === "string") {
+        atts.push({ path: c.path, name: baseName(c.path) });
+      } else if ((t === "image" || t === "input_image") && (typeof c.url === "string" || typeof c.image_url === "string")) {
+        const url = typeof c.url === "string" ? c.url : c.image_url;
+        atts.push({ url, name: "image" });
+      }
+    }
+    return { text: textParts.join("\n"), attachments: atts };
+  }
+
   function renderThread(thread) {
     if (!thread) return;
     clearChat();
@@ -626,11 +1107,14 @@
         if (!item || typeof item !== "object") continue;
         if (item.type === "userMessage") {
           closeCommandGroup();
-          addUserMessage(toUserText(item.content));
+          const parsed = parseUserContent(item.content);
+          addUserMessage(parsed.text, parsed.attachments);
         } else if (item.type === "agentMessage") {
           closeCommandGroup();
           const row = addRowFromTemplate(tplAssistant);
-          row.querySelector(".bubble").textContent = normalizeAssistantText(item.text || "");
+          const bubble = row.querySelector(".bubble");
+          if (item.html && typeof item.html === "string") renderHtmlInto(bubble, item.html);
+          else renderTextWithLinks(bubble, normalizeAssistantText(item.text || ""));
         } else if (item.type === "plan") {
           closeCommandGroup();
           addSystemMessage("plan:\n" + (item.text || ""));
@@ -650,9 +1134,8 @@
             if (ui.statusEl) ui.statusEl.textContent = String(item.status || "");
             if (ui.outputEl) {
               const out = item.aggregatedOutput || "";
-              ui.outputEl.textContent = out
-                ? `$ ${String(item.command || "").trim()}\n\n${out}`
-                : `$ ${String(item.command || "").trim()}`;
+              const rendered = out ? `$ ${String(item.command || "").trim()}\n\n${out}` : `$ ${String(item.command || "").trim()}`;
+              renderTextWithLinks(ui.outputEl, rendered);
             }
           }
         } else if (item.type === "fileChange") {
@@ -704,6 +1187,18 @@
     const bubble = row.querySelector(".bubble");
     bubble.classList.add("approval");
 
+    function jsonPreview(v, maxChars) {
+      const max = typeof maxChars === "number" && maxChars > 0 ? maxChars : 2000;
+      try {
+        const s = JSON.stringify(v ?? {}, null, 2);
+        if (typeof s !== "string") return String(v ?? "");
+        if (s.length <= max) return s;
+        return s.slice(0, Math.max(0, max - 64)) + `\n… (truncated, ${s.length} chars total)`;
+      } catch {
+        return String(v ?? "");
+      }
+    }
+
     const title = document.createElement("div");
     title.textContent = `Approval requested: ${method}`;
     bubble.appendChild(title);
@@ -711,7 +1206,7 @@
     const detail = document.createElement("pre");
     detail.style.margin = "0";
     detail.style.whiteSpace = "pre-wrap";
-    detail.textContent = JSON.stringify(params ?? {}, null, 2);
+    detail.textContent = jsonPreview(params ?? {}, 2000);
     bubble.appendChild(detail);
 
     const actions = document.createElement("div");
@@ -789,6 +1284,9 @@
   function doSend() {
     const text = input.value.trim();
     if (!text && attachments.length === 0) return;
+    if (pendingSend) return;
+    pendingSend = true;
+    allowBusyUI = true;
     const threadId = state && state.threadId ? String(state.threadId) : "";
     input.value = "";
     vscode.postMessage({ type: "send", text, attachments });
@@ -843,9 +1341,47 @@
     return `${preview || t.id}${updated ? " · " + updated : ""}`;
   }
 
+  function resolveEffectiveModelId(s, models) {
+    const explicit = s && s.settings && typeof s.settings.model === "string" ? s.settings.model : "";
+    if (explicit) return explicit;
+
+    const thread = s && s.thread ? s.thread : null;
+    const threadCandidates = [
+      thread && typeof thread.model === "string" ? thread.model : "",
+      thread && thread.settings && typeof thread.settings.model === "string" ? thread.settings.model : "",
+      thread && thread.run && typeof thread.run.model === "string" ? thread.run.model : "",
+      thread && thread.config && typeof thread.config.model === "string" ? thread.config.model : ""
+    ].filter(Boolean);
+    if (threadCandidates.length) return threadCandidates[0];
+
+    const cfg = s && s.config ? s.config : null;
+    const configCandidates = [
+      cfg && typeof cfg.model === "string" ? cfg.model : "",
+      cfg && typeof cfg.defaultModel === "string" ? cfg.defaultModel : "",
+      cfg && cfg.defaults && typeof cfg.defaults.model === "string" ? cfg.defaults.model : "",
+      cfg && cfg.run && typeof cfg.run.model === "string" ? cfg.run.model : ""
+    ].filter(Boolean);
+    if (configCandidates.length) return configCandidates[0];
+
+    const visible = Array.isArray(models) ? models.filter((m) => m && !m.hidden) : [];
+    const flagged =
+      visible.find((m) => m && (m.isDefault === true || m.default === true || m.is_default === true)) || null;
+    if (flagged && typeof flagged.model === "string" && flagged.model) return flagged.model;
+
+    return visible[0] && typeof visible[0].model === "string" ? visible[0].model : "";
+  }
+
+  function resolveEffectiveModelLabel(models, modelId) {
+    const list = Array.isArray(models) ? models : [];
+    const m = list.find((x) => x && x.model === modelId) || null;
+    if (m && typeof m.displayName === "string" && m.displayName) return m.displayName;
+    return modelId || "loading...";
+  }
+
   function updateEffortOptions() {
     if (!state) return;
-    const model = (state.models || []).find((m) => m.model === state.settings.model);
+    const effectiveModelId = resolveEffectiveModelId(state, state.models || []);
+    const model = (state.models || []).find((m) => m.model === effectiveModelId);
     const supported = (model && model.supportedReasoningEfforts) || [];
     const opts = supported.length
       ? supported.map((e) => ({ value: e.reasoningEffort, label: e.reasoningEffort }))
@@ -864,10 +1400,12 @@
     const prevThreadId = state && state.threadId ? String(state.threadId) : null;
     state = s;
     const models = (s.models || []).filter((m) => !m.hidden);
+    const effectiveModelId = resolveEffectiveModelId(s, models);
+    const effectiveModelLabel = resolveEffectiveModelLabel(models, effectiveModelId);
     setOptions(
       modelSelect,
-      [{ value: "", label: "model: default" }, ...models.map((m) => ({ value: m.model, label: m.displayName }))],
-      s.settings.model || ""
+      [{ value: "", label: `model: ${effectiveModelLabel}` }, ...models.map((m) => ({ value: m.model, label: m.displayName }))],
+      (s.settings && s.settings.model) || ""
     );
 
     if (taskTitle) {
@@ -928,7 +1466,8 @@
     }
 
     renderRateFooter(s.rateLimits);
-    setBusy(Boolean(s && s.busy));
+    serverBusy = Boolean(s && s.busy);
+    setBusy(serverBusy && allowBusyUI);
 
     const t = s.thread || null;
     const updatedAt = t && typeof t.updatedAt === "number" ? t.updatedAt : null;
@@ -938,17 +1477,35 @@
     }
   }
 
-  function labelForWindow(key, w) {
+  function applyAccessSettingsPatch(patch) {
+    if (!state) return;
+    const nextSettings = Object.assign({}, state.settings || {}, patch || {});
+    // applyState() updates labels/selects consistently without re-rendering the thread,
+    // unless threadId/updatedAt changed (they won't here).
+    applyState(Object.assign({}, state, { settings: nextSettings }));
+  }
+
+  function windowDurationMins(w) {
+    const mins = Number(w && (w.windowDurationMins ?? w.windowMins));
+    if (Number.isFinite(mins) && mins > 0) return mins;
+
     const secs = Number(w && (w.windowSeconds ?? w.windowSec ?? w.window ?? w.periodSeconds ?? w.periodSec));
-    if (Number.isFinite(secs) && secs > 0) {
-      if (secs >= 4 * 3600 && secs <= 6 * 3600) return "5h";
-      if (secs >= 6 * 24 * 3600 && secs <= 8 * 24 * 3600) return "week";
+    if (Number.isFinite(secs) && secs > 0) return secs / 60;
+
+    return null;
+  }
+
+  function labelForWindow(key, w) {
+    const mins = windowDurationMins(w);
+    if (mins !== null) {
+      if (mins === 300) return "5h";
+      if (mins === 10080) return "week";
     }
+
     const k = String(key || "").toLowerCase();
-    if (k.includes("5h") || k.includes("five")) return "5h";
+    if (k === "primary") return "5h";
+    if (k === "secondary") return "week";
     if (k.includes("week")) return "week";
-    if (k.includes("primary")) return "5h";
-    if (k.includes("secondary")) return "week";
     return k || "rate";
   }
 
@@ -962,23 +1519,29 @@
   function pickRateWindows(rateLimits) {
     if (!rateLimits || typeof rateLimits !== "object") return [];
 
+    const source =
+      rateLimits.rateLimits && typeof rateLimits.rateLimits === "object"
+        ? rateLimits.rateLimits
+        : rateLimits;
+
     const out = [];
-    const keys = ["primary", "secondary", "fiveHour", "five_hour", "hour5", "week", "weekly"];
-    for (const k of keys) {
-      if (rateLimits[k]) out.push({ key: k, window: rateLimits[k] });
-    }
-    if (Array.isArray(rateLimits.windows)) {
-      for (const w of rateLimits.windows) out.push({ key: "window", window: w });
+    if (source.primary) out.push({ key: "primary", window: source.primary });
+    if (source.secondary) out.push({ key: "secondary", window: source.secondary });
+
+    if (out.length === 0 && Array.isArray(source.windows)) {
+      for (const w of source.windows) out.push({ key: "window", window: w });
     }
 
-    const seen = new Set();
-    const uniq = [];
-    for (const it of out) {
-      if (seen.has(it.window)) continue;
-      seen.add(it.window);
-      uniq.push(it);
+    if (out.length === 0 && source.rateLimitsByLimitId && typeof source.rateLimitsByLimitId === "object") {
+      for (const entry of Object.values(source.rateLimitsByLimitId)) {
+        if (!entry || typeof entry !== "object") continue;
+        if (entry.primary) out.push({ key: "primary", window: entry.primary });
+        if (entry.secondary) out.push({ key: "secondary", window: entry.secondary });
+        if (out.length > 0) break;
+      }
     }
-    return uniq;
+
+    return out;
   }
 
   function renderRateFooter(rateLimits) {
@@ -989,7 +1552,11 @@
     for (const it of wins) {
       const remaining = toRemainingPercent(it.window);
       if (remaining === null) continue;
-      labeled.push({ label: labelForWindow(it.key, it.window), remaining });
+      labeled.push({
+        label: labelForWindow(it.key, it.window),
+        remaining,
+        resetsAt: Number(it.window && it.window.resetsAt)
+      });
     }
 
     const byLabel = new Map();
@@ -1012,6 +1579,9 @@
       b.className = "badge";
       const label = it.label === "5h" ? "5時間" : it.label === "week" ? "週" : it.label;
       b.textContent = `${label} 残り ${Math.round(it.remaining)}%`;
+      if (Number.isFinite(it.resetsAt) && it.resetsAt > 0) {
+        b.title = `リセット: ${new Date(it.resetsAt * 1000).toLocaleString()}`;
+      }
       rateFooter.appendChild(b);
     }
   }
@@ -1022,6 +1592,34 @@
       e.preventDefault();
       if (!isBusy) doSend();
     }
+  });
+  input.addEventListener("dragover", (e) => {
+    if (e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files")) {
+      e.preventDefault();
+    }
+  });
+  input.addEventListener("drop", (e) => {
+    const dt = e.dataTransfer;
+    if (!dt || !dt.files || dt.files.length === 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    for (const f of Array.from(dt.files)) {
+      if (f && typeof f.path === "string" && f.path) addAttachmentPath(f.path);
+      else uploadFileObject(f);
+    }
+  });
+  input.addEventListener("paste", (e) => {
+    const cd = e.clipboardData;
+    if (!cd || !cd.items) return;
+    const files = [];
+    for (const item of Array.from(cd.items)) {
+      if (!item || item.kind !== "file") continue;
+      const f = item.getAsFile ? item.getAsFile() : null;
+      if (f) files.push(f);
+    }
+    if (files.length === 0) return;
+    e.preventDefault();
+    for (const f of files) uploadFileObject(f);
   });
   input.addEventListener("input", schedulePersistDraft);
   input.addEventListener("blur", () => persistDraftNow());
@@ -1055,6 +1653,46 @@
   if (attachFiles) {
     attachFiles.addEventListener("click", () => {
       vscode.postMessage({ type: "pickFiles" });
+    });
+  }
+
+  if (chat) {
+    chat.addEventListener("click", (e) => {
+      const t = e.target;
+      const a = t && typeof t.closest === "function" ? t.closest("a") : null;
+      if (!a) return;
+      const href = String(a.getAttribute("href") || "");
+      if (!href || href === "#") return;
+
+      // Don't let the webview navigate.
+      e.preventDefault();
+      e.stopPropagation();
+
+      if (/^https?:\/\//i.test(href)) {
+        vscode.postMessage({ type: "openExternal", url: href });
+        return;
+      }
+
+      // file-like: path:line:col or path#LlineCcol
+      let path = href;
+      let line = undefined;
+      let column = undefined;
+
+      const hashMatch = /^(.*)#L(\d+)(?:C(\d+))?$/.exec(href);
+      if (hashMatch) {
+        path = hashMatch[1];
+        line = Number(hashMatch[2]);
+        column = hashMatch[3] ? Number(hashMatch[3]) : undefined;
+      } else {
+        const m = /^(.*?)(?::(\d+))?(?::(\d+))?$/.exec(href);
+        if (m) {
+          path = m[1];
+          line = m[2] ? Number(m[2]) : undefined;
+          column = m[3] ? Number(m[3]) : undefined;
+        }
+      }
+
+      vscode.postMessage({ type: "openFileAt", path, line, column });
     });
   }
 
@@ -1139,6 +1777,7 @@
     const currentSandbox = (state.settings && state.settings.sandbox) || null;
     const nextSandbox = currentSandbox === "danger-full-access" ? null : "danger-full-access";
     const approvalPolicy = (state.settings && state.settings.approvalPolicy) || null;
+    applyAccessSettingsPatch({ sandbox: nextSandbox });
     vscode.postMessage({ type: "setAccessSettings", approvalPolicy, sandbox: nextSandbox });
   });
 
@@ -1147,6 +1786,7 @@
     const currentApproval = (state.settings && state.settings.approvalPolicy) || null;
     const nextApproval = currentApproval === "never" ? "on-request" : "never";
     const sandbox = (state.settings && state.settings.sandbox) || null;
+    applyAccessSettingsPatch({ approvalPolicy: nextApproval });
     vscode.postMessage({ type: "setAccessSettings", approvalPolicy: nextApproval, sandbox });
   });
 
@@ -1183,6 +1823,18 @@
     const msg = event.data;
     if (!msg || typeof msg !== "object") return;
 
+    if (msg.type === "shikiCss") {
+      const css = String(msg.css || "");
+      if (!shikiStyleEl) {
+        shikiStyleEl = document.createElement("style");
+        shikiStyleEl.id = "shiki-style";
+        if (cspNonce) shikiStyleEl.setAttribute("nonce", cspNonce);
+        document.head.appendChild(shikiStyleEl);
+      }
+      shikiStyleEl.textContent = css;
+      return;
+    }
+
     if (msg.type === "status") {
       status.textContent = msg.message ? `${msg.status}: ${msg.message}` : msg.status;
       return;
@@ -1193,6 +1845,13 @@
       return;
     }
 
+    if (msg.type === "rateLimits") {
+      const rateLimits = msg.rateLimits || null;
+      if (state && typeof state === "object") state.rateLimits = rateLimits;
+      renderRateFooter(rateLimits);
+      return;
+    }
+
     if (msg.type === "attachments") {
       attachments = Array.isArray(msg.files) ? msg.files : [];
       renderAttachments();
@@ -1200,8 +1859,20 @@
       return;
     }
 
+    if (msg.type === "attachmentsAdd") {
+      const files = Array.isArray(msg.files) ? msg.files : [];
+      for (const p of files) addAttachmentPath(p);
+      return;
+    }
+
     if (msg.type === "userMessage") {
-      addUserMessage(msg.text);
+      addUserMessage(msg.text, Array.isArray(msg.attachments) ? msg.attachments : []);
+      return;
+    }
+
+    if (msg.type === "filePreview") {
+      const path = String(msg.path || "");
+      applyPreview(path, msg.dataUrl);
       return;
     }
 
@@ -1211,6 +1882,10 @@
     }
 
     if (msg.type === "assistantStart") {
+      allowBusyUI = true;
+      pendingSend = false;
+      pendingAssistantItems++;
+      if (!isBusy) setBusy(true);
       closeCommandGroup();
       const row = ensureAssistantRow(msg.itemId);
       const bubble = row && row.querySelector ? row.querySelector(".bubble") : null;
@@ -1219,6 +1894,9 @@
     }
 
     if (msg.type === "assistantDelta") {
+      allowBusyUI = true;
+      pendingSend = false;
+      if (!isBusy) setBusy(true);
       closeCommandGroup();
       const row = ensureAssistantRow(msg.itemId);
       const bubble = row.querySelector(".bubble");
@@ -1234,7 +1912,18 @@
       const row = ensureAssistantRow(msg.itemId);
       const bubble = row.querySelector(".bubble");
       bubble.classList.remove("pending");
-      bubble.textContent = normalizeAssistantText(msg.text);
+      if (typeof msg.html === "string" && msg.html) renderHtmlInto(bubble, msg.html);
+      else renderTextWithLinks(bubble, normalizeAssistantText(msg.text));
+      scrollToBottom();
+      if (pendingAssistantItems > 0) pendingAssistantItems--;
+      scheduleMaybeClearBusy();
+      return;
+    }
+
+    if (msg.type === "assistantRendered") {
+      const row = ensureAssistantRow(msg.itemId);
+      const bubble = row.querySelector(".bubble");
+      renderHtmlInto(bubble, msg.html);
       scrollToBottom();
       return;
     }
@@ -1250,8 +1939,9 @@
     if (msg.type === "systemDone") {
       closeCommandGroup();
       const row = ensureSystemRow(msg.itemId);
-      row.querySelector(".bubble").textContent = msg.text;
+      renderTextWithLinks(row.querySelector(".bubble"), msg.text);
       scrollToBottom();
+      scheduleMaybeClearBusy();
       return;
     }
 
@@ -1275,8 +1965,13 @@
           // Prefer the aggregated output if the stream was empty or truncated.
           // If streaming already filled content, keep it as-is to avoid jumpiness.
         }
+        renderTextWithLinks(ui.outputEl, ui.outputEl.textContent);
       }
+      if (activeCommand && activeCommand.itemId === msg.itemId) activeCommand = null;
+      renderActivityIndicator();
       scrollToBottom();
+      if (pendingCommandItems > 0) pendingCommandItems--;
+      scheduleMaybeClearBusy();
       return;
     }
 
@@ -1296,6 +1991,10 @@
         }
         pre.textContent += msg.delta;
       }
+      if (!activeFileChange || activeFileChange.itemId !== msg.itemId) {
+        activeFileChange = { itemId: msg.itemId };
+        renderActivityIndicator();
+      }
       scrollToBottom();
       return;
     }
@@ -1308,7 +2007,11 @@
       if (ui.subEl) ui.subEl.textContent = `${changes.length} files`;
       if (ui.countEl) ui.countEl.textContent = String(changes.length);
       if (ui.bodyEl) renderFileChangesInto(ui.bodyEl, changes);
+      if (activeFileChange && activeFileChange.itemId === msg.itemId) activeFileChange = null;
+      renderActivityIndicator();
       scrollToBottom();
+      if (pendingFileItems > 0) pendingFileItems--;
+      scheduleMaybeClearBusy();
       return;
     }
 
@@ -1336,27 +2039,48 @@
     }
 
     if (msg.type === "commandExecutionStart") {
+      allowBusyUI = true;
+      pendingSend = false;
+      pendingCommandItems++;
+      if (!isBusy) setBusy(true);
       const ui = ensureCommandExecutionUI(msg.itemId);
       if (ui.detailsEl) ui.detailsEl.classList.add("pending");
       if (ui.previewEl) ui.previewEl.textContent = clampPreview(msg.command || "", 80);
       if (ui.statusEl) ui.statusEl.textContent = "running";
+      activeCommand = { itemId: msg.itemId, command: String(msg.command || "") };
+      renderActivityIndicator();
       scrollToBottom();
       return;
     }
 
     if (msg.type === "fileChangeStart") {
+      allowBusyUI = true;
+      pendingSend = false;
+      pendingFileItems++;
+      if (!isBusy) setBusy(true);
       closeCommandGroup();
       const ui = ensureFileChangeUI(msg.itemId);
       if (ui.detailsEl) ui.detailsEl.classList.add("pending");
       if (ui.subEl) ui.subEl.textContent = "編集中…";
+      activeFileChange = { itemId: msg.itemId };
+      renderActivityIndicator();
       scrollToBottom();
       return;
     }
 
     if (msg.type === "turnBusy") {
       if (state && state.threadId && msg.threadId && state.threadId !== msg.threadId) return;
-      setBusy(Boolean(msg.busy));
+      pendingSend = false;
+      if (msg.busy) allowBusyUI = true;
+      serverBusy = Boolean(msg.busy);
+      setBusy(serverBusy && allowBusyUI);
       if (!msg.busy) {
+        activeCommand = null;
+        activeFileChange = null;
+        pendingAssistantItems = 0;
+        pendingCommandItems = 0;
+        pendingFileItems = 0;
+        clearBusyToken++;
         const ui = ensureFileChangeUI("__turn_diff__");
         if (ui.detailsEl) ui.detailsEl.classList.remove("pending");
       }

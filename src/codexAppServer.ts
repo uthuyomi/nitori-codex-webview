@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
-import { stat, readdir } from "node:fs/promises";
+import { open, readFile, stat, readdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import * as path from "node:path";
 import type { JsonObject, JsonRpcMessage, JsonRpcRequest } from "./types";
@@ -216,14 +216,159 @@ export function userTextInput(text: string) {
   return [{ type: "text", text, text_elements: [] }];
 }
 
-export function userInputs(text: string, mentionPaths: string[]) {
+function isImagePath(p: string) {
+  const ext = String(p).trim().toLowerCase().split(".").pop() ?? "";
+  // NOTE: Keep this conservative: only common bitmap formats that the model/UI can handle well.
+  return ext === "png" || ext === "jpg" || ext === "jpeg" || ext === "gif" || ext === "webp" || ext === "bmp";
+}
+
+function isLikelyTextPath(p: string): boolean {
+  const ext = path.extname(p).toLowerCase();
+  return (
+    ext === ".txt" ||
+    ext === ".md" ||
+    ext === ".json" ||
+    ext === ".jsonc" ||
+    ext === ".yaml" ||
+    ext === ".yml" ||
+    ext === ".toml" ||
+    ext === ".ini" ||
+    ext === ".xml" ||
+    ext === ".csv" ||
+    ext === ".ts" ||
+    ext === ".tsx" ||
+    ext === ".js" ||
+    ext === ".jsx" ||
+    ext === ".mjs" ||
+    ext === ".cjs" ||
+    ext === ".py" ||
+    ext === ".rb" ||
+    ext === ".go" ||
+    ext === ".rs" ||
+    ext === ".java" ||
+    ext === ".kt" ||
+    ext === ".c" ||
+    ext === ".h" ||
+    ext === ".cc" ||
+    ext === ".cpp" ||
+    ext === ".hpp" ||
+    ext === ".cs" ||
+    ext === ".php" ||
+    ext === ".sh" ||
+    ext === ".ps1" ||
+    ext === ".sql" ||
+    ext === ".css" ||
+    ext === ".scss" ||
+    ext === ".html" ||
+    ext === ".env"
+  );
+}
+
+function fenceLangFromPath(p: string): string {
+  const ext = path.extname(p).toLowerCase();
+  if (ext === ".ts") return "ts";
+  if (ext === ".tsx") return "tsx";
+  if (ext === ".js" || ext === ".mjs" || ext === ".cjs") return "js";
+  if (ext === ".jsx") return "jsx";
+  if (ext === ".json" || ext === ".jsonc") return "json";
+  if (ext === ".md") return "md";
+  if (ext === ".yaml" || ext === ".yml") return "yaml";
+  if (ext === ".toml") return "toml";
+  if (ext === ".xml") return "xml";
+  if (ext === ".py") return "py";
+  if (ext === ".rb") return "rb";
+  if (ext === ".go") return "go";
+  if (ext === ".rs") return "rs";
+  if (ext === ".java") return "java";
+  if (ext === ".kt") return "kt";
+  if (ext === ".c") return "c";
+  if (ext === ".h") return "h";
+  if (ext === ".cc" || ext === ".cpp") return "cpp";
+  if (ext === ".hpp") return "hpp";
+  if (ext === ".cs") return "cs";
+  if (ext === ".php") return "php";
+  if (ext === ".sh") return "sh";
+  if (ext === ".ps1") return "powershell";
+  if (ext === ".sql") return "sql";
+  if (ext === ".css") return "css";
+  if (ext === ".scss") return "scss";
+  if (ext === ".html") return "html";
+  return "";
+}
+
+async function readHeadBytes(filePath: string, maxBytes: number): Promise<Buffer> {
+  const fh = await open(filePath, "r");
+  try {
+    const buf = Buffer.allocUnsafe(maxBytes);
+    const res = await fh.read(buf, 0, maxBytes, 0);
+    return buf.subarray(0, res.bytesRead);
+  } finally {
+    await fh.close();
+  }
+}
+
+export async function userInputs(text: string, mentionPaths: string[]) {
   const out: any[] = [];
   if (text.trim().length > 0) out.push({ type: "text", text, text_elements: [] });
+
+  const maxImageBytes = 3 * 1024 * 1024;
+  const maxTextBytes = 300 * 1024;
+
   for (const p of mentionPaths) {
-    if (!p) continue;
-    const name = String(p).split(/[\\/]/).pop() ?? String(p);
-    out.push({ type: "mention", name, path: p });
+    const filePath = String(p ?? "").trim();
+    if (!filePath) continue;
+
+    let st: Awaited<ReturnType<typeof stat>> | null = null;
+    try {
+      st = await stat(filePath);
+    } catch {
+      out.push({ type: "text", text: `Attached path (not found): ${filePath}`, text_elements: [] });
+      continue;
+    }
+
+    if (!st.isFile()) {
+      out.push({ type: "text", text: `Attached path (not a file): ${filePath}`, text_elements: [] });
+      continue;
+    }
+
+    if (isImagePath(filePath)) {
+      if (st.size > maxImageBytes) {
+        out.push({
+          type: "text",
+          text: `Attached image (too large: ${st.size} bytes): ${filePath}`,
+          text_elements: []
+        });
+        continue;
+      }
+      out.push({ type: "localImage", path: filePath });
+      continue;
+    }
+
+    if (isLikelyTextPath(filePath)) {
+      const isTruncated = st.size > maxTextBytes;
+      try {
+        const buf = isTruncated ? await readHeadBytes(filePath, maxTextBytes) : await readFile(filePath);
+        const body = buf.toString("utf8");
+        const lang = fenceLangFromPath(filePath);
+        const header = `Attached file: ${filePath}${isTruncated ? ` (truncated to first ${buf.length} bytes of ${st.size})` : ""}`;
+        out.push({
+          type: "text",
+          text: `${header}\n\n\`\`\`${lang}\n${body}\n\`\`\``,
+          text_elements: []
+        });
+      } catch {
+        out.push({ type: "text", text: `Attached file (read failed): ${filePath}`, text_elements: [] });
+      }
+      continue;
+    }
+
+    out.push({
+      type: "text",
+      text: `Attached file: ${filePath} (${st.size} bytes)`,
+      text_elements: []
+    });
   }
+
   return out;
 }
 

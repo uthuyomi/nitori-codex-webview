@@ -3,13 +3,27 @@
 **/src/**
 **/scripts/**
 **/tmp-proto/**
+
+# Exclude build/test/config artifacts
 **/*.ts
 **/*.map
+**/*.vsix
+tsconfig.json
+tmp-shiki-test.mjs
+
+# Default-exclude packaged asset folders, then opt-in only what we need.
+dist/**
+media/**
+resources/**
 
 # Keep runtime assets
-!dist/**
-!media/**
-!resources/**
+!dist/extension.js
+!media/main.js
+!media/main.css
+!media/toolkit.min.js
+!media/background.png
+!media/nitori.png
+!resources/nitori.svg
 !package.json
 !README.md
 !README.ja.md

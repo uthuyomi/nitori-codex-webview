@@ -22,7 +22,7 @@ export function getWebviewHtml(webview: vscode.Webview, extensionUri: vscode.Uri
 
   const csp = [
     `default-src 'none'`,
-    `img-src ${webview.cspSource} data:`,
+    `img-src ${webview.cspSource} data: https:`,
     `style-src ${webview.cspSource} 'nonce-${n}'`,
     `script-src 'nonce-${n}'`
   ].join("; ");
@@ -170,6 +170,17 @@ export function getWebviewHtml(webview: vscode.Webview, extensionUri: vscode.Uri
     <main class="chat" id="chat">
     </main>
 
+    <div class="activity-indicator" id="activityIndicator" hidden aria-live="polite">
+      <div class="activity-top">
+        <span class="activity-dot" aria-hidden="true"></span>
+        <span class="activity-kind" id="activityKind">思考中</span>
+        <span class="activity-detail" id="activityDetail"></span>
+      </div>
+      <div class="activity-bottom">
+        <code class="activity-cwd" id="activityCwd"></code>
+      </div>
+    </div>
+
     <footer class="composer">
       <div class="composer-row">
         <button class="icon-btn" id="attachFiles" title="Attach files" aria-label="Attach files">
@@ -222,7 +233,7 @@ export function getWebviewHtml(webview: vscode.Webview, extensionUri: vscode.Uri
       </div>
     </template>
     <script nonce="${n}">
-      window.__NITORI_CODEX__ = { avatarSrc: ${JSON.stringify(String(avatarUri))} };
+      window.__NITORI_CODEX__ = { avatarSrc: ${JSON.stringify(String(avatarSrc))} };
     </script>
     <script type="module" nonce="${n}" src="${toolkitUri}"></script>
     <script nonce="${n}" src="${scriptUri}"></script>

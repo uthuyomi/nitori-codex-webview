@@ -25,6 +25,11 @@ body {
   overflow-x: hidden;
 }
 
+/* Ensure the HTML `hidden` attribute always hides, even when a class sets `display`. */
+[hidden] {
+  display: none !important;
+}
+
 body::before {
   content: "";
   position: fixed;
@@ -487,9 +492,9 @@ vscode-option[aria-selected="true"] {
 }
 
 .avatar {
-  width: 56px;
-  height: 56px;
-  border-radius: 10px;
+  width: 112px;
+  height: 112px;
+  border-radius: 9999px;
   border: 1px solid var(--border);
   background: color-mix(in srgb, var(--fg) 4%, transparent);
 }
@@ -536,6 +541,86 @@ vscode-option[aria-selected="true"] {
 
 .muted {
   color: var(--muted);
+}
+
+.codex-link {
+  color: var(--vscode-textLink-foreground, #3794ff);
+  text-decoration: none;
+  cursor: pointer;
+}
+.codex-link:hover {
+  color: var(--vscode-textLink-activeForeground, #4fc1ff);
+  text-decoration: underline;
+}
+
+/* Markdown + Shiki */
+.bubble p {
+  margin: 0 0 8px 0;
+  white-space: pre-wrap;
+}
+.bubble p:last-child {
+  margin-bottom: 0;
+}
+.bubble ul,
+.bubble ol {
+  margin: 6px 0 6px 18px;
+  padding: 0;
+}
+.bubble li {
+  margin: 2px 0;
+}
+.bubble blockquote {
+  margin: 6px 0;
+  padding-left: 10px;
+  border-left: 3px solid var(--border);
+  color: var(--muted);
+}
+.bubble code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+}
+.bubble pre {
+  margin: 8px 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.bubble pre code {
+  display: block;
+  padding: 10px 12px;
+}
+
+pre.shiki {
+  line-height: 1.5;
+}
+
+pre.shiki,
+pre.shiki span {
+  font-style: normal !important;
+  font-weight: normal !important;
+  text-decoration: none !important;
+}
+
+/* Only paint the background on the container, not per-token spans (avoids seams/blocks). */
+pre.shiki span {
+  background-color: transparent !important;
+}
+
+body.vscode-dark pre.shiki {
+  color: var(--shiki-dark);
+  background-color: var(--shiki-dark-bg);
+}
+body.vscode-dark pre.shiki span {
+  color: var(--shiki-dark);
+}
+body.vscode-light pre.shiki,
+body.vscode-high-contrast-light pre.shiki {
+  color: var(--shiki-light);
+  background-color: var(--shiki-light-bg);
+}
+body.vscode-light pre.shiki span,
+body.vscode-high-contrast-light pre.shiki span {
+  color: var(--shiki-light);
 }
 
 .fold {
@@ -688,6 +773,95 @@ pre.diff {
   color: color-mix(in srgb, var(--fg) 70%, #a371f7);
 }
 
+.activity-indicator {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+  box-sizing: border-box;
+  font-size: 12px;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--bg) 92%, transparent);
+}
+
+.activity-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.activity-bottom {
+  padding-left: 16px;
+}
+
+.activity-indicator code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 11px;
+  color: color-mix(in srgb, var(--fg) 70%, var(--muted));
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
+  max-width: 52vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activity-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #3fb950;
+  box-shadow: 0 0 0 3px color-mix(in srgb, #3fb950 12%, transparent);
+  flex: 0 0 auto;
+}
+
+.activity-indicator[data-kind="command"] .activity-dot {
+  background: #58a6ff;
+  box-shadow: 0 0 0 3px color-mix(in srgb, #58a6ff 12%, transparent);
+}
+
+.activity-indicator[data-kind="file"] .activity-dot {
+  background: #a371f7;
+  box-shadow: 0 0 0 3px color-mix(in srgb, #a371f7 12%, transparent);
+}
+
+.activity-indicator.is-active .activity-dot {
+  animation: niti-blink 1s steps(2, end) infinite;
+}
+
+.activity-indicator.is-active .activity-kind {
+  animation: niti-blink-soft 1.2s ease-in-out infinite;
+}
+
+@keyframes niti-blink {
+  0% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.2;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+@keyframes niti-blink-soft {
+  0% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.65;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
 .composer {
   padding: 10px;
   border-top: 1px solid var(--border);
@@ -787,6 +961,31 @@ pre.diff {
   max-width: 100%;
 }
 
+.chip-thumb {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  object-fit: cover;
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
+  flex: 0 0 auto;
+}
+
+.chip-thumb.is-loading {
+  opacity: 0.65;
+  filter: grayscale(1);
+}
+
+.chip-thumb.is-missing {
+  opacity: 0.35;
+}
+
+.chip-thumb-msg {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+}
+
 .chip .chip-text {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -802,6 +1001,25 @@ pre.diff {
   background: transparent;
   color: var(--muted);
   cursor: pointer;
+}
+
+.chip .chip-act {
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.chip .chip-act:hover {
+  color: var(--fg);
+  border-color: color-mix(in srgb, var(--fg) 18%, var(--border));
+}
+
+.attachments-msg {
+  margin-top: 8px;
 }
 
 textarea {
