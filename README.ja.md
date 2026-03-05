@@ -1,56 +1,84 @@
 # Nitori Codex Webview
 
-ローカルの `codex app-server`（stdio / JSON-RPC）に接続する、軽量な Webview チャット UI を VS Code 上で提供する拡張です。アバター/背景の差し替えや、Codex 風のタスク選択 UI で作業履歴の切り替えができます。
+ローカルの `codex app-server`（stdio / JSON-RPC）と接続して動く、VS Code 用の軽量 Webview チャット UI です。UI は “Codexっぽさ” を意識しつつ、実処理はあなたのマシン上の Codex CLI を使います。
 
 English: `README.md`
 
 ## 主な機能
 
-- Codex 風の **タスク選択 UI**（タスク一覧/切り替え）
-- メッセージ内で **コマンド実行** や **編集済みファイル / diff** を見やすく表示
-- 実行中は送信ボタンが停止ボタンに変わり **中断（Interrupt）** が可能
-- **sandbox / approval** の切り替え（安全性と操作性のトレードオフ）
-- **モデル選択** と **推論強度（reasoning effort）** の切り替え
-- ヘッダーを最小化し、**レート/利用状況** は入力欄まわりに集約
+- Codex ライクな **タスクピッカー**（タスク作成 / 選択）
+- **コマンド実行**や**編集ファイル / diff**を見やすく表示
+- 実行中の処理を **Interrupt（停止）**
+- **Sandbox mode** と **Approval policy** をすばやく切り替え
+- **モデル選択** / **reasoning effort** の選択
+- コンポーザー付近に **usage / rate** の状態表示
 
-## インストール（VSIX）
+## インストール
 
-1. `.vsix` ファイルを用意します（例: `nitori-codex-webview-0.0.6.vsix`）。
-2. インストールします:
+### VS Code Marketplace から
+
+- Marketplace で `Nitori Codex Webview` を検索
+- もしくは拡張IDでインストール:
 
 ```bash
-code --install-extension path/to/nitori-codex-webview-0.0.6.vsix
+code --install-extension kaisei-yasuzaki.nitori-codex-webview
 ```
 
-## 使い方
+### VSIX から
 
-- アクティビティバーの `Nitori` → `Nitori Codex` を開く
-- もしくはコマンドパレットから `Nitori: Open Codex Webview`（エディタパネルで開く）
+```bash
+code --install-extension path/to/nitori-codex-webview-0.0.35.vsix
+```
 
-## 必要要件
+## 使い方（最短）
 
-- ローカルに `codex` CLI がインストールされていること
-- `codex` が PATH にない場合や、実行ファイルを固定したい場合は、設定 `nitoriCodex.codexPath` でパスを指定できます
+1. ターミナルで `codex` コマンドが実行できる状態にします。
+2. VS Code のアクティビティバーで `Nitori` → `Nitori Codex` を開きます。
+3. またはコマンドパレットから `Nitori: Open Codex Webview` を実行します。
 
-## 仕組み（採用担当・レビュー向けに最短で）
+## 必要条件
 
-- **Extension Host** がローカルの Codex プロセス（`codex app-server`）を起動/制御し、Webview からの要求を中継します
-- **Webview** はチャット UI を描画し、VS Code のメッセージング API 経由で拡張側にイベントを送ります
-- 基本構成では **外部の専用バックエンド不要**（ローカルの `codex` に接続）
+- VS Code `^1.109.0`
+- ローカルの `codex` CLI（拡張が `codex app-server` を起動します）
 
-## 安全性 / 権限について（採用担当・レビュー向けの補足も兼ねる）
+## 設定
 
-この拡張は「UI（Webview）でローカルの Codex app-server を操作する」構成です。実際に何ができるかは、選択しているポリシーに依存します。
+- `nitoriCodex.codexPath`: `codex` 実行ファイルへのパス（`PATH` に無い場合や、特定のビルドに固定したい場合）
+- `nitoriCodex.verboseEvents`: 内部イベントをチャットに表示（ノイズ/負荷が増えます）
 
-- **Sandbox**: ローカル環境へのアクセス範囲（安全寄り/強力寄りの調整）
-- **Approval**: ツール実行などを都度確認するかどうか
-- たとえば強い権限（フルアクセス寄り）を選ぶと、より強力な操作が可能になります。ローカルでスクリプトを実行するのと同程度に、設定と扱いには注意してください。
+## 仕組み（ざっくり）
 
-## 開発者向け（任意）
+- **Extension Host** がローカルで `codex app-server` を起動・制御し、メッセージを仲介します。
+- **Webview UI** がチャット表示を行い、VS Code のメッセージングAPI経由で拡張へイベントを送ります。
+- この拡張自体はホスト型バックエンドを持ちません。
+
+## セキュリティ上の注意
+
+この拡張は「ローカルのエージェントプロセスを操作するUI」です。実際に何ができるかは UI で選ぶポリシーに依存します。
+
+- **Sandbox mode**: ローカル環境へのアクセス範囲（コマンド/ツールの権限）に影響します。
+- **Approval policy**: 実行前に確認を挟むかどうかを制御します。
+- 危険な設定（例: フルアクセス）にした場合は、その権限でローカルスクリプトを動かすのと同等だと考えてください。
+
+## トラブルシュート
+
+- `disconnected` のままなら、ターミナルで `codex` が動くか確認し、必要なら `nitoriCodex.codexPath` を設定してください。
+- UI は出るのに動かない場合は、VS Code の **出力** から拡張のログを確認してください。
+
+## 開発
 
 ```bash
 npm install
 npm run build
 ```
 
-VS Code 上で `F5`（Extension Development Host）を起動し、`Nitori` → `Nitori Codex` を開いて確認します。
+VS Code で `F5` を押して Extension Development Host を起動し、`Nitori` → `Nitori Codex` を開きます。
+
+## ライセンス
+
+MIT（`LICENSE` を参照）。
+
+## 免責
+
+本プロジェクトは非公式のファンメイドであり、上海アリス幻樂団 / ZUN 氏とは一切関係ありません。承認・推薦を受けたものでもありません。
+東方Projectは上海アリス幻樂団 / ZUN 氏の商標・著作物です。

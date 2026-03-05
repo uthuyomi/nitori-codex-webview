@@ -1,56 +1,86 @@
 # Nitori Codex Webview
 
-A VS Code extension that provides a lightweight Webview chat UI for the local `codex app-server` (stdio JSON-RPC), with a customizable avatar/background and a Codex-like task picker.
+A lightweight VS Code Webview chat UI for the local `codex app-server` (stdio JSON-RPC). It’s designed to feel like Codex, while running everything through your local Codex CLI.
 
 Japanese: `README.ja.md`
 
-## Key features
+## Features
 
-- Codex-like **task picker** (task list / selection UI)
+- Codex-like **task picker** (create / select tasks)
 - Rich message blocks for **command execution** and **edited files / diffs**
 - **Interrupt** in-progress work (stop button while the agent is running)
-- Quick controls for **sandbox** and **approval** policies
+- Quick controls for **sandbox mode** and **approval policy**
 - **Model selection** and **reasoning effort** selection
-- Displays **usage / rate** status in the composer area (so the header stays minimal)
+- Shows **usage / rate** status near the composer
 
-## Install (VSIX)
+## Install
 
-1. Get the `.vsix` file (for example: `nitori-codex-webview-0.0.6.vsix`).
-2. Install it:
+### From VS Code Marketplace
+
+- Search for: `Nitori Codex Webview`
+- Or install by ID:
 
 ```bash
-code --install-extension path/to/nitori-codex-webview-0.0.6.vsix
+code --install-extension kaisei-yasuzaki.nitori-codex-webview
 ```
 
-## Usage
+### From a VSIX
 
-- Open the Activity Bar container: `Nitori` → `Nitori Codex`
-- Or open an editor panel from Command Palette: `Nitori: Open Codex Webview`
+```bash
+code --install-extension path/to/nitori-codex-webview-0.0.35.vsix
+```
+
+## Quick start
+
+1. Ensure the `codex` CLI is installed and runnable from a terminal.
+2. In VS Code, open the Activity Bar view container: `Nitori` → `Nitori Codex`.
+3. Or open an editor panel from Command Palette: `Nitori: Open Codex Webview`.
 
 ## Requirements
 
-- Local `codex` CLI available on your machine
-- Optional: set `nitoriCodex.codexPath` (Settings) if `codex` is not on PATH, or if you want to pin a specific executable.
+- VS Code `^1.109.0`
+- A local `codex` CLI installation (the extension starts `codex app-server`)
 
-## Architecture (quick review)
+## Configuration
 
-- **Extension Host**: starts/controls a local Codex process (`codex app-server`) and proxies requests.
-- **Webview**: renders the chat UI and sends UI events to the extension via VS Code messaging APIs.
-- **No hosted backend required**: the default setup talks to your local `codex` installation.
+Settings:
 
-## Security notes (for users & reviewers)
+- `nitoriCodex.codexPath`: Path to the `codex` executable (use this if `codex` is not in `PATH` or you want to pin a specific build).
+- `nitoriCodex.verboseEvents`: Show verbose internal events in the chat (can be noisy/slow).
 
-This extension is a UI wrapper around the local Codex app-server. The actual capabilities depend on your selected policies:
+## How it works (high level)
 
-- **Sandbox mode** controls how commands/tools are allowed to interact with your environment.
-- **Approval policy** controls whether tool/actions require confirmation.
-- If you choose an unsafe configuration (for example a full-access mode), treat it like running local scripts with that level of privilege.
+- **Extension Host** starts/controls a local Codex process (`codex app-server`) and proxies messages.
+- **Webview UI** renders the chat and sends UI events to the extension via VS Code messaging APIs.
+- No hosted backend is required by this extension itself.
 
-## Development (optional)
+## Security notes
+
+This extension is a UI wrapper around a local agent process. Actual capabilities depend on what you enable in the UI:
+
+- **Sandbox mode** affects what local commands/tools can do.
+- **Approval policy** controls whether actions require your confirmation.
+- If you choose an unsafe configuration (e.g. full access), treat it like running local scripts with that level of privilege.
+
+## Troubleshooting
+
+- If it stays on `disconnected`, verify `codex` runs in a terminal, or set `nitoriCodex.codexPath`.
+- If the UI loads but nothing happens, open **Output** → the extension’s output channel and check logs.
+
+## Development
 
 ```bash
 npm install
 npm run build
 ```
 
-Then press `F5` in VS Code to launch an Extension Development Host and open `Nitori` → `Nitori Codex`.
+Press `F5` in VS Code to launch an Extension Development Host, then open `Nitori` → `Nitori Codex`.
+
+## License
+
+MIT (see `LICENSE`).
+
+## Disclaimer
+
+This is an unofficial fan-made project and is not affiliated with or endorsed by Team Shanghai Alice / ZUN.
+Touhou Project is a trademark and/or copyrighted work of Team Shanghai Alice / ZUN.

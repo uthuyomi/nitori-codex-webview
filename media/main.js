@@ -40,6 +40,25 @@
   const tplAssistant = document.getElementById("msg-assistant");
   const tplSystem = document.getElementById("msg-system");
 
+  function autoResizeInput() {
+    if (!input || input.tagName !== "TEXTAREA") return;
+    try {
+      const style = getComputedStyle(input);
+      const minH = Number.parseFloat(style.minHeight);
+      const maxH = Number.parseFloat(style.maxHeight);
+      const minPx = Number.isFinite(minH) ? minH : 0;
+      const maxPx = Number.isFinite(maxH) ? maxH : null;
+
+      input.style.height = "auto";
+      const desired = input.scrollHeight;
+      const next = Math.max(minPx, maxPx ? Math.min(desired, maxPx) : desired);
+      input.style.height = `${next}px`;
+      if (maxPx) input.style.overflowY = desired > maxPx ? "auto" : "hidden";
+    } catch {
+      // ignore
+    }
+  }
+
   const assistantByItemId = new Map();
   const systemByItemId = new Map();
   const systemKindByItemId = new Map();
@@ -357,6 +376,7 @@
     input.value = d && typeof d.text === "string" ? d.text : "";
     attachments = d && Array.isArray(d.attachments) ? d.attachments : [];
     renderAttachments();
+    autoResizeInput();
   }
 
   function setSettingsOpen(open) {
@@ -1289,6 +1309,7 @@
     allowBusyUI = true;
     const threadId = state && state.threadId ? String(state.threadId) : "";
     input.value = "";
+    autoResizeInput();
     vscode.postMessage({ type: "send", text, attachments });
     attachments = [];
     renderAttachments();
@@ -1657,8 +1678,14 @@
     e.preventDefault();
     for (const f of files) uploadFileObject(f);
   });
-  input.addEventListener("input", schedulePersistDraft);
+  input.addEventListener("input", () => {
+    autoResizeInput();
+    schedulePersistDraft();
+  });
   input.addEventListener("blur", () => persistDraftNow());
+
+  window.addEventListener("resize", () => autoResizeInput());
+  autoResizeInput();
 
   if (openSettings) {
     openSettings.addEventListener("click", () => {
@@ -1788,6 +1815,7 @@
     vscode.postMessage({ type: "newThread" });
     // Reset the composer draft so it feels like a clean task switch.
     if (input) input.value = "";
+    autoResizeInput();
     attachments = [];
     renderAttachments();
     setTaskPickerOpen(false);

@@ -1025,6 +1025,9 @@ pre.diff {
 textarea {
   flex: 1;
   resize: none;
+  min-height: 44px;
+  max-height: min(240px, 40vh);
+  overflow-y: hidden;
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 10px;

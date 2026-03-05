@@ -2,7 +2,7 @@
   "name": "nitori-codex-webview",
   "displayName": "Nitori Codex Webview",
   "description": "A lightweight Webview chat UI that talks to the local Codex app-server, with a customizable avatar.",
-  "version": "0.0.34",
+  "version": "0.0.35",
   "publisher": "kaisei-yasuzaki",
   "engines": {
     "vscode": "^1.109.0"
