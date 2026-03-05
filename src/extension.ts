@@ -396,6 +396,24 @@ export function activate(context: vscode.ExtensionContext) {
 
   const client = new CodexAppServerClient({
     onNotification: (msg) => {
+      if (msg.method === "account/rateLimits/updated") {
+        const p = msg.params as any;
+        const rateLimits = p?.rateLimits ?? null;
+        try {
+          const nextJson = JSON.stringify(rateLimits);
+          if (nextJson !== lastRateLimitsJson) {
+            lastRateLimitsJson = nextJson;
+            lastRateLimitsFetchAtMs = Date.now();
+            postAll({ type: "rateLimits", rateLimits });
+          }
+        } catch {
+          // ignore
+        }
+        // Still schedule a refresh in case the notification payload is partial.
+        scheduleRateLimitsRefresh(0);
+        return;
+      }
+
       if (msg.method === "thread/tokenUsage/updated") {
         // Usage updates can arrive frequently while streaming; keep the footer in sync,
         // but throttle requests to the server.

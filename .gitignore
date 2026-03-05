@@ -4,9 +4,15 @@ node_modules/
 # Build artifacts (keep dist output, but ignore maps)
 dist/*.map
 
+# VSIX artifacts
+*.vsix
+
 # Local/test scratch files
 tmp-*/
 tmp-*.mjs
+
+# Local config (keep examples checked in instead)
+config.toml
 
 # OS / editor junk
 .DS_Store

@@ -1511,9 +1511,29 @@
 
   function toRemainingPercent(w) {
     if (!w || typeof w !== "object") return null;
-    if (typeof w.remainingPercent === "number") return w.remainingPercent;
-    if (typeof w.usedPercent === "number") return Math.max(0, Math.min(100, 100 - w.usedPercent));
+    if (typeof w.remainingPercent === "number") {
+      const r = Number(w.remainingPercent);
+      if (!Number.isFinite(r)) return null;
+      // Heuristic: some servers may return 0..1; prefer treating fractional values as ratios.
+      if (r >= 0 && r <= 1 && String(w.remainingPercent).includes(".")) return Math.max(0, Math.min(100, r * 100));
+      return Math.max(0, Math.min(100, r));
+    }
+    if (typeof w.usedPercent === "number") {
+      const u = Number(w.usedPercent);
+      if (!Number.isFinite(u)) return null;
+      // Heuristic: if usedPercent is fractional (0..1 with decimals), treat it as a ratio.
+      if (u >= 0 && u <= 1 && String(w.usedPercent).includes(".")) return Math.max(0, Math.min(100, 100 - u * 100));
+      return Math.max(0, Math.min(100, 100 - u));
+    }
     return null;
+  }
+
+  function fmtPercent(p) {
+    const n = Number(p);
+    if (!Number.isFinite(n)) return null;
+    const clamped = Math.max(0, Math.min(100, n));
+    const s = clamped.toFixed(2);
+    return s.replace(/\.?0+$/g, "");
   }
 
   function pickRateWindows(rateLimits) {
@@ -1525,18 +1545,22 @@
         : rateLimits;
 
     const out = [];
-    if (source.primary) out.push({ key: "primary", window: source.primary });
-    if (source.secondary) out.push({ key: "secondary", window: source.secondary });
+    const baseLimitId = typeof source.limitId === "string" ? source.limitId : "";
+    const baseLimitName = typeof source.limitName === "string" ? source.limitName : "";
+    if (source.primary) out.push({ key: "primary", window: source.primary, limitId: baseLimitId, limitName: baseLimitName });
+    if (source.secondary) out.push({ key: "secondary", window: source.secondary, limitId: baseLimitId, limitName: baseLimitName });
 
     if (out.length === 0 && Array.isArray(source.windows)) {
-      for (const w of source.windows) out.push({ key: "window", window: w });
+      for (const w of source.windows) out.push({ key: "window", window: w, limitId: baseLimitId, limitName: baseLimitName });
     }
 
     if (out.length === 0 && source.rateLimitsByLimitId && typeof source.rateLimitsByLimitId === "object") {
       for (const entry of Object.values(source.rateLimitsByLimitId)) {
         if (!entry || typeof entry !== "object") continue;
-        if (entry.primary) out.push({ key: "primary", window: entry.primary });
-        if (entry.secondary) out.push({ key: "secondary", window: entry.secondary });
+        const limitId = typeof entry.limitId === "string" ? entry.limitId : "";
+        const limitName = typeof entry.limitName === "string" ? entry.limitName : "";
+        if (entry.primary) out.push({ key: "primary", window: entry.primary, limitId, limitName });
+        if (entry.secondary) out.push({ key: "secondary", window: entry.secondary, limitId, limitName });
         if (out.length > 0) break;
       }
     }
@@ -1555,7 +1579,12 @@
       labeled.push({
         label: labelForWindow(it.key, it.window),
         remaining,
-        resetsAt: Number(it.window && it.window.resetsAt)
+        resetsAt: Number(it.window && it.window.resetsAt),
+        usedRaw: it.window && typeof it.window.usedPercent === "number" ? it.window.usedPercent : null,
+        remainingRaw: it.window && typeof it.window.remainingPercent === "number" ? it.window.remainingPercent : null,
+        windowMins: windowDurationMins(it.window),
+        limitId: typeof it.limitId === "string" ? it.limitId : "",
+        limitName: typeof it.limitName === "string" ? it.limitName : ""
       });
     }
 
@@ -1577,11 +1606,18 @@
     for (const it of ordered) {
       const b = document.createElement("div");
       b.className = "badge";
-      const label = it.label === "5h" ? "5時間" : it.label === "week" ? "週" : it.label;
-      b.textContent = `${label} 残り ${Math.round(it.remaining)}%`;
-      if (Number.isFinite(it.resetsAt) && it.resetsAt > 0) {
-        b.title = `リセット: ${new Date(it.resetsAt * 1000).toLocaleString()}`;
-      }
+      const label = it.label === "5h" ? "5hour" : it.label === "week" ? "Weekly" : it.label;
+      const shown = fmtPercent(it.remaining);
+      b.textContent = `${label} 残り ${shown === null ? "?" : shown}%`;
+      const parts = [];
+      if (it.limitId) parts.push(`limitId=${it.limitId}`);
+      if (it.limitName) parts.push(`limitName=${it.limitName}`);
+      if (Number.isFinite(it.windowMins) && it.windowMins > 0) parts.push(`window=${it.windowMins}m`);
+      if (it.usedRaw !== null) parts.push(`usedRaw=${it.usedRaw}`);
+      if (it.remainingRaw !== null) parts.push(`remainingRaw=${it.remainingRaw}`);
+      if (shown !== null) parts.push(`remainingShown=${shown}%`);
+      if (Number.isFinite(it.resetsAt) && it.resetsAt > 0) parts.push(`resetsAt=${new Date(it.resetsAt * 1000).toLocaleString()}`);
+      if (parts.length) b.title = parts.join(" · ");
       rateFooter.appendChild(b);
     }
   }

@@ -3,6 +3,8 @@
 **/src/**
 **/scripts/**
 **/tmp-proto/**
+.gitignore
+config*.toml
 
 # Exclude build/test/config artifacts
 **/*.ts
@@ -27,3 +29,4 @@ resources/**
 !package.json
 !README.md
 !README.ja.md
+!LICENSE
