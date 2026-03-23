@@ -22,6 +22,8 @@ resources/**
 !dist/extension.js
 !media/main.js
 !media/main.css
+!media/renderQueue.js
+!media/threadHistory.js
 !media/toolkit.min.js
 !media/background.png
 !media/nitori.png

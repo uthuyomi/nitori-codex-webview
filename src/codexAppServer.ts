@@ -4,6 +4,7 @@ import { open, readFile, stat, readdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import * as path from "node:path";
 import type { JsonObject, JsonRpcMessage, JsonRpcRequest } from "./types";
+import { normalizeBaseInstructions, normalizeDeveloperInstructions, normalizePersonality } from "./runSettings";
 
 type PendingRequest = {
   resolve: (value: unknown) => void;
@@ -187,7 +188,15 @@ export type ThreadStartResult = {
 
 export async function startThread(
   client: CodexAppServerClient,
-  opts?: { model?: string | null; cwd?: string | null; approvalPolicy?: string | null; sandbox?: string | null }
+  opts?: {
+    model?: string | null;
+    cwd?: string | null;
+    approvalPolicy?: string | null;
+    sandbox?: string | null;
+    baseInstructions?: string | null;
+    developerInstructions?: string | null;
+    personality?: string | null;
+  }
 ): Promise<ThreadStartResult> {
   const res = (await client.request(
     "thread/start",
@@ -196,6 +205,9 @@ export async function startThread(
       cwd: opts?.cwd ?? null,
       approvalPolicy: opts?.approvalPolicy ?? null,
       sandbox: opts?.sandbox ?? null,
+      baseInstructions: normalizeBaseInstructions(opts?.baseInstructions),
+      developerInstructions: normalizeDeveloperInstructions(opts?.developerInstructions),
+      personality: normalizePersonality(opts?.personality),
       experimentalRawEvents: false,
       persistExtendedHistory: true
     },

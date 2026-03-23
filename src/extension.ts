@@ -4,9 +4,21 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { inspect } from "node:util";
+import { detectAgentsFile, ensureWorkspaceAgentsFile } from "./agentsInstructions";
 import { CodexAppServerClient, detectCodexExecutable, startThread, userInputs, userTextInput } from "./codexAppServer";
+import {
+  normalizeBaseInstructions,
+  normalizeCollaborationMode,
+  normalizeDeveloperInstructions,
+  normalizePersonality,
+  normalizeUiLocale,
+  runSettingsKey as settingsKey,
+  type RunSettings
+} from "./runSettings";
+import { AppStateCache } from "./stateCache";
 import { getWebviewHtml } from "./webviewHtml";
 import { NitoriCodexSidebarViewProvider } from "./sidebarView";
+import { HistoryRenderer } from "./historyRenderer";
 import { renderMarkdownWithShiki } from "./markdownRender";
 
 type WebviewToExtension =
@@ -21,6 +33,16 @@ type WebviewToExtension =
   | { type: "resumeThread"; threadId: string }
   | { type: "setRunSettings"; model: string | null; effort: string | null }
   | { type: "setAccessSettings"; approvalPolicy: string | null; sandbox: string | null }
+  | {
+      type: "setInstructionSettings";
+      baseInstructions: string | null;
+      developerInstructions: string | null;
+      personality: string | null;
+      collaborationMode: string | null;
+    }
+  | { type: "setUiLocale"; locale: string | null }
+  | { type: "openAgentsInstructions" }
+  | { type: "createAgentsInstructions" }
   | { type: "pickFiles" }
   | { type: "uploadFiles"; files: Array<{ name: string; mime?: string; dataBase64: string }> }
   | { type: "openExternal"; url: string }
@@ -76,13 +98,23 @@ export function activate(context: vscode.ExtensionContext) {
   let connectionStatus: "connecting" | "ready" | "error" = "connecting";
   const webviews = new Set<vscode.Webview>();
   let lastInteractiveWebview: vscode.Webview | null = null;
+  let ensureServerReadyPromise: Promise<void> | null = null;
   let ensureReadyPromise: Promise<void> | null = null;
   let lastShikiCss = "";
-  const renderedHtmlByAgentItemId = new Map<string, string>();
   const respondedRequestIds = new Set<string | number>();
   const busyByThreadId = new Map<string, { turnId: string; busy: boolean }>();
   const pendingApprovalByRequestId = new Map<string | number, { method: string; params: unknown }>();
   const recentCommandApprovalsByThreadId = new Map<string, { cmd: string; atMs: number }>();
+  const stateCache = new AppStateCache();
+  let lastHistoryThreadId = "";
+  const historyRenderer = new HistoryRenderer(
+    (itemId, html) => {
+      postAll({ type: "assistantRendered", itemId, html });
+    },
+    (css) => {
+      maybeUpdateShikiCss(css);
+    }
+  );
 
   let lastRateLimitsJson = "";
   let lastRateLimitsFetchAtMs = 0;
@@ -382,14 +414,6 @@ export function activate(context: vscode.ExtensionContext) {
     return Boolean(legacyCmd && recent.cmd && legacyCmd === recent.cmd);
   }
 
-  const settingsKey = {
-    threadId: "nitoriCodex.threadId",
-    model: "nitoriCodex.model",
-    effort: "nitoriCodex.effort",
-    approvalPolicy: "nitoriCodex.approvalPolicy",
-    sandbox: "nitoriCodex.sandbox"
-  } as const;
-
   const cfg = vscode.workspace.getConfiguration("nitoriCodex");
   const configuredCodexPath = cfg.get<string | null>("codexPath") ?? null;
   const verboseEvents = Boolean(cfg.get<boolean>("verboseEvents") ?? false);
@@ -399,6 +423,7 @@ export function activate(context: vscode.ExtensionContext) {
       if (msg.method === "account/rateLimits/updated") {
         const p = msg.params as any;
         const rateLimits = p?.rateLimits ?? null;
+        stateCache.updateRateLimits(rateLimits);
         try {
           const nextJson = JSON.stringify(rateLimits);
           if (nextJson !== lastRateLimitsJson) {
@@ -425,6 +450,8 @@ export function activate(context: vscode.ExtensionContext) {
         const p = msg.params as any;
         const threadId = String(p?.threadId ?? "");
         const turnId = String(p?.turn?.id ?? "");
+        stateCache.invalidateLists();
+        stateCache.invalidateThread(threadId);
         if (threadId && turnId) {
           busyByThreadId.set(threadId, { turnId, busy: true });
           postAll({ type: "turnBusy", threadId, turnId, busy: true });
@@ -437,6 +464,8 @@ export function activate(context: vscode.ExtensionContext) {
         const p = msg.params as any;
         const threadId = String(p?.threadId ?? "");
         const turnId = String(p?.turn?.id ?? "");
+        stateCache.invalidateLists();
+        stateCache.invalidateThread(threadId);
         if (threadId) {
           const prev = busyByThreadId.get(threadId);
           if (!prev || !turnId || prev.turnId === turnId) {
@@ -517,7 +546,6 @@ export function activate(context: vscode.ExtensionContext) {
               const rendered = await renderMarkdownWithShiki(text);
               maybeUpdateShikiCss(rendered.shikiCss);
               if (rendered.html && rendered.html.trim()) {
-                renderedHtmlByAgentItemId.set(item.id, rendered.html);
                 postAll({ type: "assistantRendered", itemId: item.id, html: rendered.html });
               }
             } catch {
@@ -877,17 +905,38 @@ export function activate(context: vscode.ExtensionContext) {
     }
   }
 
-  async function ensureReady() {
+  async function ensureServerReady() {
     if (client.isRunning()) return;
-    if (ensureReadyPromise) return await ensureReadyPromise;
+    if (ensureServerReadyPromise) return await ensureServerReadyPromise;
 
-    ensureReadyPromise = (async () => {
+    ensureServerReadyPromise = (async () => {
       connectionStatus = "connecting";
       postAll({ type: "status", status: "connecting" });
       try {
         await ensureClientCodexPath();
         await client.start();
+        connectionStatus = "ready";
+        postAll({ type: "status", status: "ready" });
+      } catch (e: any) {
+        connectionStatus = "error";
+        postAll({ type: "status", status: "error", message: String(e?.message ?? e) });
+        throw e;
+      }
+    })();
 
+    try {
+      await ensureServerReadyPromise;
+    } finally {
+      ensureServerReadyPromise = null;
+    }
+  }
+
+  async function ensureReady() {
+    await ensureServerReady();
+    if (ensureReadyPromise) return await ensureReadyPromise;
+
+    ensureReadyPromise = (async () => {
+      try {
         const settings = getRunSettings();
         const cwd = getWorkspaceCwd();
         const existingThreadId = (((context.workspaceState as any).get(settingsKey.threadId) as string) || "").trim();
@@ -900,6 +949,9 @@ export function activate(context: vscode.ExtensionContext) {
               cwd,
               approvalPolicy: settings.approvalPolicy,
               sandbox: settings.sandbox,
+              baseInstructions: settings.baseInstructions,
+              developerInstructions: settings.developerInstructions,
+              personality: settings.personality,
               persistExtendedHistory: true
             });
             activeThreadId = existingThreadId;
@@ -914,15 +966,16 @@ export function activate(context: vscode.ExtensionContext) {
             model: settings.model,
             cwd,
             approvalPolicy: settings.approvalPolicy,
-            sandbox: settings.sandbox
+            sandbox: settings.sandbox,
+            baseInstructions: settings.baseInstructions,
+            developerInstructions: settings.developerInstructions,
+            personality: settings.personality
           });
           activeThreadId = started.threadId;
         }
 
         (context.workspaceState as any).update(settingsKey.threadId, activeThreadId);
-        connectionStatus = "ready";
         postAll({ type: "status", status: "ready", message: `thread=${activeThreadId}` });
-        await refreshState();
       } catch (e: any) {
         connectionStatus = "error";
         postAll({ type: "status", status: "error", message: String(e?.message ?? e) });
@@ -942,32 +995,107 @@ export function activate(context: vscode.ExtensionContext) {
     return f?.uri.fsPath ?? null;
   }
 
-  function getRunSettings() {
+  function getRunSettings(): RunSettings {
     const model = ((context.workspaceState as any).get(settingsKey.model) as string | null) ?? null;
     const effort = ((context.workspaceState as any).get(settingsKey.effort) as string | null) ?? null;
     const approvalPolicy =
       ((context.workspaceState as any).get(settingsKey.approvalPolicy) as string | null) ?? null;
     const sandbox = ((context.workspaceState as any).get(settingsKey.sandbox) as string | null) ?? null;
-    return { model, effort, approvalPolicy, sandbox };
+    const baseInstructions = normalizeBaseInstructions((context.workspaceState as any).get(settingsKey.baseInstructions));
+    const developerInstructions = normalizeDeveloperInstructions(
+      (context.workspaceState as any).get(settingsKey.developerInstructions)
+    );
+    const personality = normalizePersonality((context.workspaceState as any).get(settingsKey.personality));
+    const collaborationMode = normalizeCollaborationMode(
+      (context.workspaceState as any).get(settingsKey.collaborationMode)
+    );
+    const uiLocale = normalizeUiLocale((context.workspaceState as any).get(settingsKey.uiLocale));
+    return {
+      model,
+      effort,
+      approvalPolicy,
+      sandbox,
+      baseInstructions,
+      developerInstructions,
+      personality,
+      collaborationMode,
+      uiLocale
+    };
   }
 
-  async function refreshState(target?: vscode.Webview) {
-    await ensureReady();
+  async function persistInstructionSettings(settings: {
+    baseInstructions: string | null;
+    developerInstructions: string | null;
+    personality: string | null;
+    collaborationMode: string | null;
+  }) {
+    await (context.workspaceState as any).update(
+      settingsKey.baseInstructions,
+      normalizeBaseInstructions(settings.baseInstructions)
+    );
+    await (context.workspaceState as any).update(
+      settingsKey.developerInstructions,
+      normalizeDeveloperInstructions(settings.developerInstructions)
+    );
+    await (context.workspaceState as any).update(settingsKey.personality, normalizePersonality(settings.personality));
+    await (context.workspaceState as any).update(
+      settingsKey.collaborationMode,
+      normalizeCollaborationMode(settings.collaborationMode)
+    );
+  }
 
+  function invalidateConversationCaches(threadId?: string | null): void {
+    stateCache.invalidateLists();
+    stateCache.invalidateThread(threadId ?? null);
+  }
+
+  async function postProvisionalState(target?: vscode.Webview) {
     const cwd = getWorkspaceCwd();
     const threadId = ((context.workspaceState as any).get(settingsKey.threadId) as string) || "";
     const settings = getRunSettings();
     const busyInfo = threadId ? busyByThreadId.get(threadId) : undefined;
+    const agentsFile = await detectAgentsFile(cwd);
+    const provisionalRateLimits = stateCache.getCachedRateLimits();
+    if (provisionalRateLimits !== null) {
+      try {
+        lastRateLimitsJson = JSON.stringify(provisionalRateLimits);
+      } catch {
+        // ignore
+      }
+    }
+    const msg: ExtensionToWebview = {
+      type: "state",
+      state: {
+        connectionStatus,
+        cwd,
+        threadId,
+        settings,
+        models: [],
+        threads: [],
+        rateLimits: provisionalRateLimits,
+        collaborationModes: [],
+        thread: null,
+        config: null,
+        agentsFile,
+        busy: Boolean(busyInfo?.busy),
+        turnId: busyInfo?.turnId ?? null
+      }
+    };
+    if (target) postTo(target, msg);
+    else postAll(msg);
+  }
 
-    const [modelsRes, threadsRes, rateRes] = await Promise.all([
-      client.request("model/list", { limit: 200, includeHidden: false }),
-      client.request("thread/list", { limit: 50 }),
-      client.request("account/rateLimits/read")
-    ]);
+  async function refreshState(target?: vscode.Webview, opts?: { includeThread?: boolean }) {
+    await ensureReady();
 
-    const models = (modelsRes as any)?.data ?? [];
-    const threads = (threadsRes as any)?.data ?? [];
-    const rateLimits = (rateRes as any)?.rateLimits ?? null;
+    const includeThread = opts?.includeThread !== false;
+    const cwd = getWorkspaceCwd();
+    const threadId = ((context.workspaceState as any).get(settingsKey.threadId) as string) || "";
+    const settings = getRunSettings();
+    const busyInfo = threadId ? busyByThreadId.get(threadId) : undefined;
+    const agentsFile = await detectAgentsFile(cwd);
+    const lists = await stateCache.getLists(client, cwd);
+    const { models, threads, rateLimits, collaborationModes, config } = lists;
     try {
       lastRateLimitsJson = JSON.stringify(rateLimits);
       lastRateLimitsFetchAtMs = Date.now();
@@ -976,48 +1104,19 @@ export function activate(context: vscode.ExtensionContext) {
     }
 
     let thread: any = null;
-    try {
-      if (threadId) {
-        const readRes = await client.request("thread/read", { threadId, includeTurns: true });
-        thread = (readRes as any)?.thread ?? null;
+    if (includeThread) {
+      if (threadId !== lastHistoryThreadId) {
+        historyRenderer.clear();
+        lastHistoryThreadId = threadId;
       }
-    } catch {
-      thread = null;
-    }
-
-    // Pre-render markdown + Shiki for history so links/code blocks stay consistent after reload.
-    try {
-      const turns = thread && Array.isArray(thread.turns) ? thread.turns : [];
-      for (const turn of turns) {
-        const items = turn && Array.isArray(turn.items) ? turn.items : [];
-        for (const item of items) {
-          if (!item || typeof item !== "object") continue;
-          if (item.type !== "agentMessage") continue;
-          const id = typeof item.id === "string" ? item.id : "";
-          const text = typeof item.text === "string" ? item.text : "";
-          if (!id || !text.trim()) continue;
-          if (renderedHtmlByAgentItemId.has(id)) {
-            item.html = renderedHtmlByAgentItemId.get(id);
-            continue;
-          }
-          if (text.length > 200_000) continue;
-          const rendered = await renderMarkdownWithShiki(text);
-          maybeUpdateShikiCss(rendered.shikiCss);
-          if (rendered.html && rendered.html.trim()) {
-            renderedHtmlByAgentItemId.set(id, rendered.html);
-            item.html = rendered.html;
-          }
-        }
+      try {
+        thread = await stateCache.getThread(client, threadId);
+      } catch {
+        thread = null;
       }
-    } catch {
-      // ignore
-    }
-
-    let config: any = null;
-    try {
-      config = await client.request("config/read", { includeLayers: false, cwd });
-    } catch {
-      config = null;
+    } else if (threadId !== lastHistoryThreadId) {
+      historyRenderer.clear();
+      lastHistoryThreadId = threadId;
     }
 
     const msg: ExtensionToWebview = {
@@ -1030,8 +1129,10 @@ export function activate(context: vscode.ExtensionContext) {
         models,
         threads,
         rateLimits,
-        thread,
+        collaborationModes,
+        thread: includeThread ? thread : null,
         config,
+        agentsFile,
         busy: Boolean(busyInfo?.busy),
         turnId: busyInfo?.turnId ?? null
       }
@@ -1043,6 +1144,10 @@ export function activate(context: vscode.ExtensionContext) {
     }
     if (target) postTo(target, msg);
     else postAll(msg);
+
+    if (includeThread && thread) {
+      void historyRenderer.renderThread(thread);
+    }
   }
 
   async function startNewThread() {
@@ -1054,12 +1159,16 @@ export function activate(context: vscode.ExtensionContext) {
       cwd,
       approvalPolicy: settings.approvalPolicy,
       sandbox: settings.sandbox,
+      baseInstructions: settings.baseInstructions,
+      developerInstructions: settings.developerInstructions,
+      personality: settings.personality,
       experimentalRawEvents: false,
       persistExtendedHistory: true
     })) as any;
     const newId = res?.thread?.id;
     if (typeof newId === "string" && newId) {
       (context.workspaceState as any).update(settingsKey.threadId, newId);
+      invalidateConversationCaches(newId);
       postAll({ type: "systemMessage", text: `New thread: ${newId}` });
       await refreshState();
     }
@@ -1074,9 +1183,13 @@ export function activate(context: vscode.ExtensionContext) {
       cwd,
       approvalPolicy: settings.approvalPolicy,
       sandbox: settings.sandbox,
+      baseInstructions: settings.baseInstructions,
+      developerInstructions: settings.developerInstructions,
+      personality: settings.personality,
       persistExtendedHistory: true
     });
     (context.workspaceState as any).update(settingsKey.threadId, threadId);
+    invalidateConversationCaches(threadId);
     postAll({ type: "systemMessage", text: `Resumed thread: ${threadId}` });
     await refreshState();
   }
@@ -1084,8 +1197,9 @@ export function activate(context: vscode.ExtensionContext) {
   async function onWebviewMessage(msg: WebviewToExtension, sourceWebview?: vscode.Webview) {
     if (msg.type === "init") {
       startRateLimitsPolling();
-      if (sourceWebview) await refreshState(sourceWebview);
-      else await refreshState();
+      await postProvisionalState(sourceWebview);
+      void refreshState(sourceWebview, { includeThread: false });
+      void refreshState(sourceWebview, { includeThread: true });
       scheduleRateLimitsRefresh(0);
       return;
     }
@@ -1180,7 +1294,57 @@ export function activate(context: vscode.ExtensionContext) {
       (context.workspaceState as any).update(settingsKey.approvalPolicy, msg.approvalPolicy);
       (context.workspaceState as any).update(settingsKey.sandbox, msg.sandbox);
       const threadId = ((context.workspaceState as any).get(settingsKey.threadId) as string) || "";
+      invalidateConversationCaches(threadId);
       if (threadId) await resumeThread(threadId);
+      await refreshState();
+      return;
+    }
+    if (msg.type === "setInstructionSettings") {
+      await persistInstructionSettings({
+        baseInstructions: msg.baseInstructions,
+        developerInstructions: msg.developerInstructions,
+        personality: msg.personality,
+        collaborationMode: msg.collaborationMode
+      });
+      const threadId = ((context.workspaceState as any).get(settingsKey.threadId) as string) || "";
+      invalidateConversationCaches(threadId);
+      if (threadId) await resumeThread(threadId);
+      await refreshState();
+      return;
+    }
+    if (msg.type === "setUiLocale") {
+      await (context.workspaceState as any).update(settingsKey.uiLocale, normalizeUiLocale(msg.locale));
+      await refreshState();
+      return;
+    }
+    if (msg.type === "openAgentsInstructions") {
+      const agentsFile = await detectAgentsFile(getWorkspaceCwd());
+      if (!agentsFile.resolvedPath || !agentsFile.exists) {
+        postAll({ type: "systemMessage", text: "AGENTS.md is not available yet." });
+        return;
+      }
+      try {
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(agentsFile.resolvedPath));
+        await vscode.window.showTextDocument(doc, { preview: false });
+      } catch {
+        postAll({ type: "systemMessage", text: `Open failed: ${agentsFile.resolvedPath}` });
+      }
+      return;
+    }
+    if (msg.type === "createAgentsInstructions") {
+      const cwd = getWorkspaceCwd();
+      if (!cwd) {
+        postAll({ type: "systemMessage", text: "Open a workspace folder before creating AGENTS.md." });
+        return;
+      }
+      try {
+        const createdPath = await ensureWorkspaceAgentsFile(cwd);
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(createdPath));
+        await vscode.window.showTextDocument(doc, { preview: false });
+        postAll({ type: "systemMessage", text: `Created AGENTS.md: ${createdPath}` });
+      } catch (e: any) {
+        postAll({ type: "systemMessage", text: `Create AGENTS.md failed: ${String(e?.message ?? e)}` });
+      }
       await refreshState();
       return;
     }
@@ -1205,11 +1369,14 @@ export function activate(context: vscode.ExtensionContext) {
         model: settings.model,
         approvalPolicy: settings.approvalPolicy,
         sandbox: settings.sandbox,
+        baseInstructions: settings.baseInstructions,
+        developerInstructions: settings.developerInstructions,
         persistExtendedHistory: true
       })) as any;
       const newId = res?.thread?.id;
       if (typeof newId === "string" && newId) {
         (context.workspaceState as any).update(settingsKey.threadId, newId);
+        invalidateConversationCaches(newId);
         postAll({ type: "systemMessage", text: `Forked thread: ${newId}` });
         await refreshState();
       }
@@ -1220,6 +1387,7 @@ export function activate(context: vscode.ExtensionContext) {
       const numTurns = Number(msg.numTurns);
       if (!threadId || !Number.isFinite(numTurns) || numTurns < 1) return;
       await client.request("thread/rollback", { threadId, numTurns });
+      invalidateConversationCaches(threadId);
       postAll({ type: "systemMessage", text: `Rolled back ${numTurns} turn(s).` });
       await refreshState();
       return;
@@ -1228,6 +1396,7 @@ export function activate(context: vscode.ExtensionContext) {
       const threadId = msg.threadId?.trim();
       if (!threadId) return;
       await client.request("thread/archive", { threadId });
+      invalidateConversationCaches(threadId);
       postAll({ type: "systemMessage", text: `Archived thread: ${threadId}` });
       await refreshState();
       return;
@@ -1236,6 +1405,7 @@ export function activate(context: vscode.ExtensionContext) {
       const threadId = msg.threadId?.trim();
       if (!threadId) return;
       await client.request("thread/unarchive", { threadId });
+      invalidateConversationCaches(threadId);
       postAll({ type: "systemMessage", text: `Unarchived thread: ${threadId}` });
       await refreshState();
       return;
@@ -1336,7 +1506,9 @@ export function activate(context: vscode.ExtensionContext) {
           approvalPolicy,
           sandboxPolicy: sandboxPolicy ?? undefined,
           model: settings.model,
-          effort: settings.effort
+          effort: settings.effort,
+          personality: settings.personality,
+          collaborationMode: settings.collaborationMode
         })) as any;
         scheduleRateLimitsRefresh();
         const turnId = String(res?.turn?.id ?? "");
@@ -1404,7 +1576,7 @@ export function activate(context: vscode.ExtensionContext) {
       }
     });
 
-    await ensureReady();
+    void ensureReady();
   });
 
   const sidebarProvider = new NitoriCodexSidebarViewProvider(context.extensionUri, (webview) => {
@@ -1432,7 +1604,9 @@ export function activate(context: vscode.ExtensionContext) {
           approvalPolicy,
           sandboxPolicy: sandboxPolicy ?? undefined,
           model: settings.model,
-          effort: settings.effort
+          effort: settings.effort,
+          personality: settings.personality,
+          collaborationMode: settings.collaborationMode
         })) as any;
         scheduleRateLimitsRefresh();
         const turnId = String(res?.turn?.id ?? "");
@@ -1495,7 +1669,6 @@ export function activate(context: vscode.ExtensionContext) {
         client.respond(requestId, { answers: wrapped });
       }
     });
-
     void ensureReady();
   });
 
@@ -1503,6 +1676,10 @@ export function activate(context: vscode.ExtensionContext) {
     cmd,
     vscode.window.registerWebviewViewProvider(NitoriCodexSidebarViewProvider.viewType, sidebarProvider)
   );
+
+  void ensureServerReady().catch(() => {
+    // Ignore warm-up failures; the UI can still retry on demand.
+  });
 }
 
 export function deactivate() {}

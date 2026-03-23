@@ -10,6 +10,30 @@
   const effortSelect = document.getElementById("effortSelect");
   const approvalSelect = document.getElementById("approvalSelect");
   const sandboxSelect = document.getElementById("sandboxSelect");
+  const uiLocaleSelect = document.getElementById("uiLocaleSelect");
+  const baseInstructionsInput = document.getElementById("baseInstructionsInput");
+  const saveBaseInstructionsBtn = document.getElementById("saveBaseInstructions");
+  const clearBaseInstructionsBtn = document.getElementById("clearBaseInstructions");
+  const developerInstructionsInput = document.getElementById("developerInstructionsInput");
+  const saveDeveloperInstructionsBtn = document.getElementById("saveDeveloperInstructions");
+  const clearDeveloperInstructionsBtn = document.getElementById("clearDeveloperInstructions");
+  const collaborationModeSelect = document.getElementById("collaborationModeSelect");
+  const personalitySelect = document.getElementById("personalitySelect");
+  const saveInstructionModesBtn = document.getElementById("saveInstructionModes");
+  const clearInstructionModesBtn = document.getElementById("clearInstructionModes");
+  const openAgentsInstructionsBtn = document.getElementById("openAgentsInstructions");
+  const createAgentsInstructionsBtn = document.getElementById("createAgentsInstructions");
+  const agentsInstructionsStatus = document.getElementById("agentsInstructionsStatus");
+  const taskSettingsTitle = document.getElementById("taskSettingsTitle");
+  const runSettingsTitle = document.getElementById("runSettingsTitle");
+  const projectInstructionsTitle = document.getElementById("projectInstructionsTitle");
+  const projectInstructionsHelp = document.getElementById("projectInstructionsHelp");
+  const baseInstructionsTitle = document.getElementById("baseInstructionsTitle");
+  const baseInstructionsHelp = document.getElementById("baseInstructionsHelp");
+  const sessionInstructionsTitle = document.getElementById("sessionInstructionsTitle");
+  const sessionInstructionsHelp = document.getElementById("sessionInstructionsHelp");
+  const modeInstructionsTitle = document.getElementById("modeInstructionsTitle");
+  const modeInstructionsHelp = document.getElementById("modeInstructionsHelp");
   const taskPickerButton = document.getElementById("taskPickerButton");
   const taskPop = document.getElementById("taskPop");
   const taskSearch = document.getElementById("taskSearch");
@@ -18,6 +42,7 @@
   const taskTitle = document.getElementById("taskTitle");
   const taskClose = document.getElementById("taskClose");
   const taskNew = document.getElementById("taskNew");
+  const taskListLabel = document.getElementById("taskListLabel");
   const newThreadBtn = document.getElementById("newThread");
   const forkThreadBtn = document.getElementById("forkThread");
   const rollback1Btn = document.getElementById("rollback1");
@@ -66,7 +91,7 @@
   let openCommandGroup = null;
   let lastTurnDiff = "";
   let state = null;
-  let lastRendered = { threadId: null, updatedAt: null };
+  let lastRendered = { threadId: null, updatedAt: null, historySignature: null };
   let attachments = [];
   const previewByPath = new Map(); // path -> dataUrl|null
   const previewReqById = new Map(); // requestId -> path
@@ -90,6 +115,12 @@
   let activeFileChange = null;
   let stickyActivity = null; // { kind, kindLabel, detailText, untilMs }
   let lastActivityKey = "";
+  let uiLocale = "ja";
+  let visibleHistoryCount = 120;
+  let currentHistoryItems = [];
+  let historyRenderJob = null;
+  let pendingAccessSettings = null;
+  let optimisticUserMessages = [];
   let persisted = vscode.getState() || {};
   let draftsByThreadId =
     persisted && typeof persisted === "object" && persisted.draftsByThreadId && typeof persisted.draftsByThreadId === "object"
@@ -105,6 +136,278 @@
       return "";
     }
   })();
+  const threadHistory = window.__NITORI_THREAD_HISTORY__ || {
+    flattenThreadItems(thread) {
+      const turns = Array.isArray(thread && thread.turns) ? thread.turns : [];
+      const items = [];
+      for (const turn of turns) {
+        if (!turn || !Array.isArray(turn.items)) continue;
+        for (const item of turn.items) items.push(item);
+      }
+      return items;
+    },
+    getHistorySignature(thread) {
+      const items = this.flattenThreadItems(thread);
+      if (!items.length) return "0";
+      const last = items[items.length - 1];
+      return `${items.length}:${String(last && last.type ? last.type : "")}:${String(last && last.id ? last.id : "")}`;
+    },
+    createHistoryWindow(items, count) {
+      const safe = Array.isArray(items) ? items : [];
+      const start = Math.max(0, safe.length - Math.max(0, Number(count) || 0));
+      return { totalItems: safe.length, hiddenCount: start, items: safe.slice(start) };
+    }
+  };
+
+  function flattenHistoryItems(thread) {
+    if (threadHistory && typeof threadHistory.flattenThreadItems === "function") {
+      try {
+        const items = threadHistory.flattenThreadItems(thread);
+        return Array.isArray(items) ? items : [];
+      } catch (error) {
+        console.warn("threadHistory.flattenThreadItems failed", error);
+      }
+    }
+
+    const turns = Array.isArray(thread && thread.turns) ? thread.turns : [];
+    const items = [];
+    for (const turn of turns) {
+      if (!turn || !Array.isArray(turn.items)) continue;
+      for (const item of turn.items) items.push(item);
+    }
+    return items;
+  }
+
+  function getThreadHistorySignature(thread) {
+    if (threadHistory && typeof threadHistory.getHistorySignature === "function") {
+      try {
+        return String(threadHistory.getHistorySignature(thread) || "0");
+      } catch (error) {
+        console.warn("threadHistory.getHistorySignature failed", error);
+      }
+    }
+
+    const items = flattenHistoryItems(thread);
+    if (!items.length) return "0";
+    const last = items[items.length - 1];
+    return `${items.length}:${String(last && last.type ? last.type : "")}:${String(last && last.id ? last.id : "")}`;
+  }
+
+  function createThreadHistoryWindow(items, count) {
+    if (threadHistory && typeof threadHistory.createHistoryWindow === "function") {
+      try {
+        const windowed = threadHistory.createHistoryWindow(items, count);
+        if (windowed && typeof windowed === "object") return windowed;
+      } catch (error) {
+        console.warn("threadHistory.createHistoryWindow failed", error);
+      }
+    }
+
+    const safe = Array.isArray(items) ? items : [];
+    const start = Math.max(0, safe.length - Math.max(0, Number(count) || 0));
+    return { totalItems: safe.length, hiddenCount: start, items: safe.slice(start) };
+  }
+  const renderQueue = window.__NITORI_RENDER_QUEUE__ || {
+    createRenderQueue(items, renderItem, options) {
+      const list = Array.isArray(items) ? items.slice() : [];
+      const chunkSize = Math.max(1, Number((options && options.chunkSize) || 24));
+      let cancelled = false;
+      return {
+        start() {
+          let index = 0;
+          function run() {
+            if (cancelled) return;
+            const end = Math.min(index + chunkSize, list.length);
+            while (index < end) {
+              renderItem(list[index], index);
+              index += 1;
+            }
+            if (index < list.length) {
+              setTimeout(run, 16);
+              return;
+            }
+            if (typeof options?.onDone === "function") options.onDone();
+          }
+          setTimeout(run, 0);
+        },
+        cancel() {
+          cancelled = true;
+        }
+      };
+    }
+  };
+
+  const localeMessages = {
+    ja: {
+      task: "タスク",
+      taskPickerTitle: "タスク一覧",
+      taskPickerButton: "タスクを開く",
+      settings: "設定",
+      searchTasks: "タスクを検索",
+      close: "閉じる",
+      taskSettingsTitle: "タスク",
+      runSettingsTitle: "実行",
+      projectInstructionsTitle: "プロジェクト指示",
+      projectInstructionsHelp: "AGENTS.md には、リポジトリ全体で共有し commit したい恒久ルールを書きます。",
+      baseInstructionsTitle: "Base Instructions",
+      baseInstructionsHelp: "AGENTS.md の上に重ねる、ワークスペース向けの継続ルールを書きます。まだ repo に commit しない個人設定向けです。",
+      sessionInstructionsTitle: "Session Instructions",
+      sessionInstructionsHelp: "今回の作業だけに効かせたい追加指示を書きます。thread の start・resume・fork 時に developerInstructions として送ります。",
+      modeInstructionsTitle: "組み込みモード",
+      modeInstructionsHelp: "Collaboration Mode は Codex の組み込み作業方針を選びます。Personality は thread と次の turn の応答スタイルを調整します。",
+      saveBaseInstructions: "Base Instructions を保存",
+      clearBaseInstructions: "Base Instructions をクリア",
+      saveSessionInstructions: "Session Instructions を保存",
+      clearSessionInstructions: "Session Instructions をクリア",
+      saveModeSettings: "モード設定を保存",
+      clearModeSettings: "モード設定をクリア",
+      newThread: "新規スレッド",
+      forkThread: "スレッドを Fork",
+      rollbackTurn: "1ターン戻す",
+      archiveThread: "スレッドをアーカイブ",
+      unarchiveThread: "アーカイブ解除",
+      openAgents: "AGENTS.md を開く",
+      createAgents: "AGENTS.md を作成",
+      attachFiles: "ファイルを添付",
+      typeMessage: "メッセージを入力",
+      send: "送信",
+      stop: "停止",
+      toggleFullAccess: "フルアクセスを切り替え",
+      toggleApproval: "承認ポリシーを切り替え",
+      default: "デフォルト",
+      fullAccess: "フルアクセス",
+      approvalOn: "承認: あり",
+      approvalOff: "承認: なし",
+      openWorkspaceForAgents: "AGENTS.md を管理するにはワークスペースを開いてください。",
+      usingInheritedAgents: "継承された AGENTS.md を使用中:",
+      usingProjectAgents: "このプロジェクトの AGENTS.md を使用中:",
+      noAgentsFound: "AGENTS.md が見つかりません。次の場所に作成できます:",
+      openAgentsDisabled: "AGENTS.md が見つかりません",
+      openWorkspaceFirst: "先にワークスペースを開いてください",
+      taskArchiveConfirm: "このタスクをアーカイブしますか？",
+      taskFallback: "タスク",
+      taskFallbackUntitled: "無題タスク",
+      thinking: "思考中",
+      editingFiles: "ファイル編集中",
+      runningCommand: "コマンド実行中",
+      noWorkspaceFolder: "(ワークスペースなし)",
+      rate5h: "5時間",
+      rateWeek: "週",
+      rateRemaining: "残り",
+      rateLoading: "取得中",
+      modelLoading: "読み込み中...",
+      effortDefault: "effort: デフォルト",
+      approvalDefault: "approval: デフォルト",
+      sandboxDefault: "sandbox: デフォルト",
+      localeDefault: "表示言語",
+      collaborationDefault: "collaboration: デフォルト",
+      personalityDefault: "personality: デフォルト",
+      uiLocaleJa: "日本語",
+      uiLocaleEn: "English",
+      personalityFriendly: "friendly",
+      personalityPragmatic: "pragmatic",
+      personalityNone: "none",
+      effortTitle: "Reasoning effort",
+      approvalTitle: "Approval policy",
+      sandboxTitle: "Sandbox mode",
+      localeTitle: "表示言語",
+      collaborationTitle: "Collaboration Mode",
+      personalityTitle: "Personality",
+      baseInstructionsPlaceholder: "AGENTS.md の上に重ねる継続ルールを書きます。",
+      sessionInstructionsPlaceholder: "今回の作業だけに効かせたい追加指示を書きます。"
+    },
+    en: {
+      task: "Task",
+      taskPickerTitle: "Tasks",
+      taskPickerButton: "Open task picker",
+      settings: "Settings",
+      searchTasks: "Search tasks",
+      close: "Close",
+      taskSettingsTitle: "Task",
+      runSettingsTitle: "Run",
+      projectInstructionsTitle: "Project Instructions",
+      projectInstructionsHelp: "Use AGENTS.md for repository rules that should be shared and committed with the project.",
+      baseInstructionsTitle: "Base Instructions",
+      baseInstructionsHelp: "Use this for durable workspace-level rules on top of AGENTS.md, especially personal rules that should not be committed yet.",
+      sessionInstructionsTitle: "Session Instructions",
+      sessionInstructionsHelp: "Use this for temporary guidance for the current task. It is sent as developerInstructions when a thread starts, resumes, or forks.",
+      modeInstructionsTitle: "Built-in Modes",
+      modeInstructionsHelp: "Collaboration Mode chooses Codex built-in working instructions. Personality adjusts the response tone for the thread and the next turn.",
+      saveBaseInstructions: "Save base instructions",
+      clearBaseInstructions: "Clear base instructions",
+      saveSessionInstructions: "Save session instructions",
+      clearSessionInstructions: "Clear session instructions",
+      saveModeSettings: "Save mode settings",
+      clearModeSettings: "Clear mode settings",
+      newThread: "New thread",
+      forkThread: "Fork thread",
+      rollbackTurn: "Rollback one turn",
+      archiveThread: "Archive thread",
+      unarchiveThread: "Unarchive thread",
+      openAgents: "Open AGENTS.md",
+      createAgents: "Create AGENTS.md",
+      attachFiles: "Attach files",
+      typeMessage: "Type a message",
+      send: "Send",
+      stop: "Stop",
+      toggleFullAccess: "Toggle full access",
+      toggleApproval: "Toggle approval policy",
+      default: "Default",
+      fullAccess: "Full access",
+      approvalOn: "Approval: on",
+      approvalOff: "Approval: off",
+      openWorkspaceForAgents: "Open a workspace folder to manage AGENTS.md.",
+      usingInheritedAgents: "Using inherited AGENTS.md:",
+      usingProjectAgents: "Using project AGENTS.md:",
+      noAgentsFound: "No AGENTS.md found. You can create one at:",
+      openAgentsDisabled: "AGENTS.md not found",
+      openWorkspaceFirst: "Open a workspace first",
+      taskArchiveConfirm: "Archive this task?",
+      taskFallback: "Task",
+      taskFallbackUntitled: "Untitled task",
+      thinking: "Thinking",
+      editingFiles: "Editing files",
+      runningCommand: "Running command",
+      noWorkspaceFolder: "(no workspace folder)",
+      rate5h: "5hour",
+      rateWeek: "Weekly",
+      rateRemaining: "remaining",
+      rateLoading: "loading",
+      modelLoading: "loading...",
+      effortDefault: "effort: default",
+      approvalDefault: "approval: default",
+      sandboxDefault: "sandbox: default",
+      localeDefault: "UI language",
+      collaborationDefault: "collaboration: default",
+      personalityDefault: "personality: default",
+      uiLocaleJa: "Japanese",
+      uiLocaleEn: "English",
+      personalityFriendly: "friendly",
+      personalityPragmatic: "pragmatic",
+      personalityNone: "none",
+      effortTitle: "Reasoning effort",
+      approvalTitle: "Approval policy",
+      sandboxTitle: "Sandbox mode",
+      localeTitle: "UI language",
+      collaborationTitle: "Collaboration Mode",
+      personalityTitle: "Personality",
+      baseInstructionsPlaceholder: "Set durable local rules that should apply on top of AGENTS.md.",
+      sessionInstructionsPlaceholder: "Add temporary instructions on top of AGENTS.md."
+    }
+  };
+
+  function t(key) {
+    const dict = localeMessages[uiLocale] || localeMessages.ja;
+    return dict[key] || localeMessages.ja[key] || key;
+  }
+
+  function setButtonLabel(el, label, title) {
+    if (!el) return;
+    const text = title || label;
+    el.title = text;
+    el.setAttribute("aria-label", text);
+    if (el.textContent && !el.querySelector("svg")) el.textContent = label;
+  }
 
   function baseName(p) {
     return String(p || "").split(/[\\/]/).pop() || String(p || "");
@@ -418,9 +721,162 @@
     return "今";
   }
 
-  function taskDisplayTitle(t) {
-    const preview = (t && t.preview ? String(t.preview) : "").replace(/\s+/g, " ").trim();
-    return preview || (t && t.id ? String(t.id) : "(task)");
+  function normalizeDeveloperInstructions(value) {
+    if (typeof value !== "string") return null;
+    const normalized = value.replace(/\r\n/g, "\n").trim();
+    return normalized ? normalized : null;
+  }
+
+  function normalizeBaseInstructions(value) {
+    if (typeof value !== "string") return null;
+    const normalized = value.replace(/\r\n/g, "\n").trim();
+    return normalized ? normalized : null;
+  }
+
+  function syncBaseInstructionsEditor(nextValue) {
+    if (!baseInstructionsInput) return;
+    if (document.activeElement === baseInstructionsInput) return;
+    baseInstructionsInput.value = typeof nextValue === "string" ? nextValue : "";
+  }
+
+  function syncDeveloperInstructionsEditor(nextValue) {
+    if (!developerInstructionsInput) return;
+    if (document.activeElement === developerInstructionsInput) return;
+    developerInstructionsInput.value = typeof nextValue === "string" ? nextValue : "";
+  }
+
+  function submitInstructionSettings(overrides) {
+    const rawBaseValue =
+      overrides && Object.prototype.hasOwnProperty.call(overrides, "baseInstructions")
+        ? overrides.baseInstructions
+        : baseInstructionsInput
+          ? baseInstructionsInput.value
+          : "";
+    const rawDeveloperValue =
+      overrides && Object.prototype.hasOwnProperty.call(overrides, "developerInstructions")
+        ? overrides.developerInstructions
+        : developerInstructionsInput
+          ? developerInstructionsInput.value
+          : "";
+    const rawPersonality =
+      overrides && Object.prototype.hasOwnProperty.call(overrides, "personality")
+        ? overrides.personality
+        : personalitySelect
+          ? personalitySelect.value
+          : "";
+    const rawCollaborationMode =
+      overrides && Object.prototype.hasOwnProperty.call(overrides, "collaborationMode")
+        ? overrides.collaborationMode
+        : collaborationModeSelect
+          ? collaborationModeSelect.value
+          : "";
+
+    const baseInstructions = normalizeBaseInstructions(rawBaseValue);
+    const developerInstructions = normalizeDeveloperInstructions(rawDeveloperValue);
+    const personality = rawPersonality ? String(rawPersonality) : null;
+    const collaborationMode = rawCollaborationMode ? String(rawCollaborationMode) : null;
+
+    if (!state) state = { settings: {} };
+    state.settings = Object.assign({}, state.settings || {}, {
+      baseInstructions,
+      developerInstructions,
+      personality,
+      collaborationMode
+    });
+    syncBaseInstructionsEditor(baseInstructions);
+    syncDeveloperInstructionsEditor(developerInstructions);
+    if (personalitySelect && document.activeElement !== personalitySelect) personalitySelect.value = personality || "";
+    if (collaborationModeSelect && document.activeElement !== collaborationModeSelect) {
+      collaborationModeSelect.value = collaborationMode || "";
+    }
+    vscode.postMessage({
+      type: "setInstructionSettings",
+      baseInstructions,
+      developerInstructions,
+      personality,
+      collaborationMode
+    });
+  }
+
+  function renderAgentsInstructionsState(s) {
+    const agentsFile = s && s.agentsFile ? s.agentsFile : null;
+    const exists = Boolean(agentsFile && agentsFile.exists);
+    const resolvedPath = agentsFile && typeof agentsFile.resolvedPath === "string" ? agentsFile.resolvedPath : "";
+    const workspacePath = agentsFile && typeof agentsFile.workspacePath === "string" ? agentsFile.workspacePath : "";
+    const scope = agentsFile && typeof agentsFile.scope === "string" ? agentsFile.scope : "none";
+
+    if (agentsInstructionsStatus) {
+      if (!workspacePath) {
+        agentsInstructionsStatus.textContent = t("openWorkspaceForAgents");
+      } else if (exists) {
+        const prefix = scope === "ancestor" ? t("usingInheritedAgents") : t("usingProjectAgents");
+        agentsInstructionsStatus.textContent = `${prefix} ${resolvedPath}`;
+      } else {
+        agentsInstructionsStatus.textContent = `${t("noAgentsFound")} ${resolvedPath}`;
+      }
+    }
+
+    if (openAgentsInstructionsBtn) {
+      openAgentsInstructionsBtn.disabled = !exists;
+      const title = exists ? t("openAgents") : t("openAgentsDisabled");
+      openAgentsInstructionsBtn.title = title;
+      openAgentsInstructionsBtn.setAttribute("aria-label", title);
+    }
+
+    if (createAgentsInstructionsBtn) {
+      createAgentsInstructionsBtn.disabled = !workspacePath;
+      const title = workspacePath ? t("createAgents") : t("openWorkspaceFirst");
+      createAgentsInstructionsBtn.title = title;
+      createAgentsInstructionsBtn.setAttribute("aria-label", title);
+    }
+  }
+
+  function normalizeTimestamp(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    return n > 1_000_000_000_000 ? n : n * 1000;
+  }
+
+  function getThreadId(thread) {
+    if (!thread || typeof thread !== "object") return "";
+    const candidates = [thread.id, thread.threadId, thread.thread_id];
+    for (const candidate of candidates) {
+      if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+    }
+    return "";
+  }
+
+  function getThreadPreview(thread) {
+    if (!thread || typeof thread !== "object") return "";
+    const candidates = [thread.preview, thread.title, thread.summary, thread.label];
+    for (const candidate of candidates) {
+      if (typeof candidate === "string" && candidate.trim()) return candidate.replace(/\s+/g, " ").trim();
+    }
+    return "";
+  }
+
+  function getThreadCwd(thread) {
+    if (!thread || typeof thread !== "object") return "";
+    const candidates = [thread.cwd, thread.path, thread.workspacePath];
+    for (const candidate of candidates) {
+      if (typeof candidate === "string" && candidate.trim()) return candidate;
+    }
+    return "";
+  }
+
+  function getThreadUpdatedAt(thread) {
+    if (!thread || typeof thread !== "object") return null;
+    const candidates = [thread.updatedAt, thread.updated_at, thread.lastUpdatedAt, thread.last_updated_at];
+    for (const candidate of candidates) {
+      const normalized = normalizeTimestamp(candidate);
+      if (normalized !== null) return normalized;
+    }
+    return null;
+  }
+
+  function taskDisplayTitle(thread) {
+    const preview = getThreadPreview(thread);
+    return preview || getThreadId(thread) || t("taskFallbackUntitled");
   }
 
   function renderTaskPicker() {
@@ -431,41 +887,42 @@
     const threads = Array.isArray(state.threads) ? state.threads : [];
 
     const filtered = q
-      ? threads.filter((t) => {
-          const title = taskDisplayTitle(t).toLowerCase();
-          return title.includes(q) || String(t.id || "").toLowerCase().includes(q);
+      ? threads.filter((thread) => {
+          const title = taskDisplayTitle(thread).toLowerCase();
+          return title.includes(q) || getThreadId(thread).toLowerCase().includes(q);
         })
       : threads;
 
-    for (const t of filtered) {
+    for (const thread of filtered) {
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "task-item";
-      if (state.threadId && t.id === state.threadId) btn.classList.add("is-active");
+      if (state.threadId && getThreadId(thread) === state.threadId) btn.classList.add("is-active");
 
       const left = document.createElement("div");
       left.style.minWidth = "0";
 
       const title = document.createElement("div");
       title.className = "task-item-title";
-      title.textContent = taskDisplayTitle(t);
+      title.textContent = taskDisplayTitle(thread);
 
       const sub = document.createElement("div");
       sub.className = "task-item-sub";
-      sub.textContent = (t && t.cwd) ? String(t.cwd) : "";
+      sub.textContent = getThreadCwd(thread);
 
       left.appendChild(title);
       left.appendChild(sub);
 
       const time = document.createElement("div");
       time.className = "task-item-time";
-      time.textContent = t && t.updatedAt ? relTime(Number(t.updatedAt)) : "";
+      const updatedAt = getThreadUpdatedAt(thread);
+      time.textContent = updatedAt ? relTime(updatedAt) : "";
 
       btn.appendChild(left);
       btn.appendChild(time);
 
       btn.addEventListener("click", () => {
-        const threadId = String(t.id || "");
+        const threadId = getThreadId(thread);
         if (!threadId) return;
         vscode.postMessage({ type: "resumeThread", threadId });
         setTaskPickerOpen(false);
@@ -561,8 +1018,8 @@
     }
     if (send) {
       send.classList.toggle("is-busy", isBusy);
-      send.title = isBusy ? "Stop" : "Send";
-      send.setAttribute("aria-label", isBusy ? "Stop" : "Send");
+      send.title = isBusy ? t("stop") : t("send");
+      send.setAttribute("aria-label", isBusy ? t("stop") : t("send"));
     }
     if (sendIconUse) {
       sendIconUse.setAttribute("href", isBusy ? "#ico-stop" : "#ico-up");
@@ -585,15 +1042,15 @@
     const now = Date.now();
 
     let kind = "thinking";
-    let kindLabel = "思考中";
+    let kindLabel = t("thinking");
     let detailText = "";
 
     if (activeFileChange) {
       kind = "file";
-      kindLabel = "ファイル編集中";
+      kindLabel = t("editingFiles");
     } else if (activeCommand) {
       kind = "command";
-      kindLabel = "コマンド執行中";
+      kindLabel = t("runningCommand");
     } else if (stickyActivity && typeof stickyActivity.untilMs === "number" && stickyActivity.untilMs > now) {
       // Keep the last non-thinking activity visible briefly so it doesn't just flash.
       kind = stickyActivity.kind || kind;
@@ -615,7 +1072,7 @@
     activityIndicator.dataset.kind = kind;
 
     if (activityKind) activityKind.textContent = kindLabel;
-    if (activityCwd) activityCwd.textContent = cwd || "(no workspace folder)";
+    if (activityCwd) activityCwd.textContent = cwd || t("noWorkspaceFolder");
     if (activityDetail) activityDetail.textContent = detailText ? ` · ${detailText}` : "";
   }
 
@@ -715,6 +1172,59 @@
         wrap.appendChild(chip);
       }
       bubble.appendChild(wrap);
+    }
+  }
+
+  function normalizeAttachmentRef(att) {
+    if (!att || typeof att !== "object") return "";
+    if (typeof att.path === "string" && att.path) return `path:${att.path}`;
+    if (typeof att.url === "string" && att.url) return `url:${att.url}`;
+    return "";
+  }
+
+  function normalizeAttachmentRefs(list) {
+    if (!Array.isArray(list)) return [];
+    return list.map((att) => normalizeAttachmentRef(att)).filter(Boolean);
+  }
+
+  function sameOptimisticUserMessage(left, right) {
+    if (!left || !right) return false;
+    if (String(left.text || "") !== String(right.text || "")) return false;
+    const leftAtts = normalizeAttachmentRefs(left.attachments);
+    const rightAtts = normalizeAttachmentRefs(right.attachments);
+    if (leftAtts.length !== rightAtts.length) return false;
+    for (let i = 0; i < leftAtts.length; i++) {
+      if (leftAtts[i] !== rightAtts[i]) return false;
+    }
+    return true;
+  }
+
+  function reconcileOptimisticUserMessages(threadId, items) {
+    const activeThreadId = String(threadId || "");
+    if (!activeThreadId || optimisticUserMessages.length === 0) return;
+
+    const seenUserMessages = [];
+    for (const item of Array.isArray(items) ? items : []) {
+      if (!item || item.type !== "userMessage") continue;
+      const parsed = parseUserContent(item.content);
+      seenUserMessages.push({ text: parsed.text, attachments: parsed.attachments });
+    }
+
+    optimisticUserMessages = optimisticUserMessages.filter((entry) => {
+      if (String(entry.threadId || "") !== activeThreadId) return true;
+      const matchIndex = seenUserMessages.findIndex((candidate) => sameOptimisticUserMessage(entry, candidate));
+      if (matchIndex < 0) return true;
+      seenUserMessages.splice(matchIndex, 1);
+      return false;
+    });
+  }
+
+  function renderOptimisticUserMessages(threadId) {
+    const activeThreadId = String(threadId || "");
+    if (!activeThreadId) return;
+    for (const entry of optimisticUserMessages) {
+      if (String(entry.threadId || "") !== activeThreadId) continue;
+      addUserMessage(entry.text, entry.attachments);
     }
   }
 
@@ -1074,6 +1584,10 @@
   }
 
   function clearChat() {
+    if (historyRenderJob) {
+      historyRenderJob.cancel();
+      historyRenderJob = null;
+    }
     assistantByItemId.clear();
     systemByItemId.clear();
     systemKindByItemId.clear();
@@ -1082,37 +1596,171 @@
     chat.textContent = "";
   }
 
-  function toUserText(content) {
-    if (!Array.isArray(content)) return "";
-    const parts = [];
-    for (const c of content) {
-      if (!c || typeof c !== "object") continue;
-      if (c.type === "text" && typeof c.text === "string") parts.push(c.text);
-      else if (c.type === "mention" && typeof c.name === "string") parts.push("@" + c.name);
-      else if (c.type === "skill" && typeof c.name === "string") parts.push("[skill] " + c.name);
-      else if (c.type === "localImage" && typeof c.path === "string") parts.push("[image] " + c.path);
-      else if (c.type === "image" && typeof c.url === "string") parts.push("[image] " + c.url);
+  function addHistoryLoadMoreRow(hiddenCount) {
+    const row = addRowFromTemplate(tplSystem);
+    const bubble = row.querySelector(".bubble");
+    bubble.textContent = "";
+    bubble.classList.add("muted");
+
+    const btn = document.createElement("button");
+    btn.className = "meta-btn";
+    btn.type = "button";
+    btn.textContent = `${hiddenCount} older items`;
+    btn.onclick = () => {
+      visibleHistoryCount += 120;
+      renderThread(state && state.thread ? state.thread : null);
+    };
+
+    bubble.appendChild(btn);
+  }
+
+  function renderThreadItem(item) {
+    if (!item || typeof item !== "object") return;
+    if (item.type === "userMessage") {
+      closeCommandGroup();
+      const parsed = parseUserContent(item.content);
+      addUserMessage(parsed.text, parsed.attachments);
+      return;
     }
-    return parts.join("\n");
+    if (item.type === "agentMessage") {
+      closeCommandGroup();
+      const itemId = typeof item.id === "string" ? item.id : "";
+      const row = itemId ? ensureAssistantRow(itemId) : addRowFromTemplate(tplAssistant);
+      const bubble = row.querySelector(".bubble");
+      if (item.html && typeof item.html === "string") renderHtmlInto(bubble, item.html);
+      else renderTextWithLinks(bubble, normalizeAssistantText(item.text || ""));
+      return;
+    }
+    if (item.type === "plan") {
+      closeCommandGroup();
+      addSystemMessage("plan:\n" + (item.text || ""));
+      return;
+    }
+    if (item.type === "reasoning") {
+      closeCommandGroup();
+      const s = Array.isArray(item.summary) ? item.summary.join("\n") : "";
+      addSystemMessage("reasoning summary:\n" + s);
+      return;
+    }
+    if (item.type === "commandExecution") {
+      const id = String(item.id || "");
+      if (!id) {
+        closeCommandGroup();
+        const out = item.aggregatedOutput || "";
+        addSystemMessage("command:\n" + (item.command || "") + (out ? "\n\n" + out : ""));
+      } else {
+        const ui = ensureCommandExecutionUI(id);
+        if (ui.previewEl) ui.previewEl.textContent = clampPreview(item.command || "", 80);
+        if (ui.statusEl) ui.statusEl.textContent = String(item.status || "");
+        if (ui.outputEl) {
+          const out = item.aggregatedOutput || "";
+          const rendered = out ? `$ ${String(item.command || "").trim()}\n\n${out}` : `$ ${String(item.command || "").trim()}`;
+          renderTextWithLinks(ui.outputEl, rendered);
+        }
+      }
+      return;
+    }
+    if (item.type === "fileChange") {
+      closeCommandGroup();
+      const id = String(item.id || "");
+      const changes = Array.isArray(item.changes) ? item.changes : [];
+      if (!id) {
+        const header = changes.map((c) => `${c.kind} ${c.path}`).join("\n");
+        addSystemMessage("file change:\n" + header);
+      } else {
+        const ui = ensureFileChangeUI(id);
+        if (ui.subEl) ui.subEl.textContent = `${changes.length} files`;
+        if (ui.countEl) ui.countEl.textContent = String(changes.length);
+        if (ui.bodyEl) {
+          renderFileChangesInto(
+            ui.bodyEl,
+            changes.map((c) => ({
+              kind: String(c && c.kind ? c.kind : ""),
+              path: String(c && c.path ? c.path : ""),
+              diff: String(c && c.diff ? c.diff : "")
+            }))
+          );
+        }
+      }
+      return;
+    }
+    if (item.type === "webSearch") {
+      closeCommandGroup();
+      addSystemMessage("web search:\n" + (item.query || ""));
+      return;
+    }
+    closeCommandGroup();
+    addSystemMessage("item: " + item.type);
+  }
+
+  function toUserText(content) {
+    const parsed = parseUserContent(content);
+    return parsed.text;
   }
 
   function parseUserContent(content) {
     const textParts = [];
     const atts = [];
-    if (!Array.isArray(content)) return { text: "", attachments: [] };
-    for (const c of content) {
-      if (!c || typeof c !== "object") continue;
-      const t = String(c.type || "");
-      if (t === "text" && typeof c.text === "string") textParts.push(c.text);
-      else if (t === "mention" && typeof c.path === "string") {
-        atts.push({ path: c.path, name: typeof c.name === "string" ? c.name : baseName(c.path) });
-      } else if ((t === "localImage" || t === "local_image") && typeof c.path === "string") {
-        atts.push({ path: c.path, name: baseName(c.path) });
-      } else if ((t === "image" || t === "input_image") && (typeof c.url === "string" || typeof c.image_url === "string")) {
-        const url = typeof c.url === "string" ? c.url : c.image_url;
-        atts.push({ url, name: "image" });
+    const seen = new Set();
+
+    function visit(value) {
+      if (value == null) return;
+      if (typeof value === "string") {
+        if (value.trim()) textParts.push(value);
+        return;
       }
+      if (Array.isArray(value)) {
+        for (const entry of value) visit(entry);
+        return;
+      }
+      if (typeof value !== "object") return;
+      if (seen.has(value)) return;
+      seen.add(value);
+
+      const t = String(value.type || "")
+        .trim()
+        .toLowerCase();
+      if ((t === "text" || t === "input_text") && typeof value.text === "string") {
+        textParts.push(value.text);
+        return;
+      }
+      if (t === "mention") {
+        if (typeof value.path === "string" && value.path) {
+          atts.push({ path: value.path, name: typeof value.name === "string" ? value.name : baseName(value.path) });
+          return;
+        }
+        if (typeof value.name === "string" && value.name) {
+          textParts.push("@" + value.name);
+          return;
+        }
+      }
+      if ((t === "localimage" || t === "local_image") && typeof value.path === "string") {
+        atts.push({ path: value.path, name: baseName(value.path) });
+        return;
+      }
+      if ((t === "image" || t === "input_image" || t === "inputimage") && (typeof value.url === "string" || typeof value.image_url === "string")) {
+        const url = typeof value.url === "string" ? value.url : value.image_url;
+        atts.push({ url, name: "image" });
+        return;
+      }
+      if (typeof value.text === "string" && value.text.trim()) {
+        textParts.push(value.text);
+      }
+      if (typeof value.message === "string" && value.message.trim()) {
+        textParts.push(value.message);
+      }
+      if (typeof value.content === "string" && value.content.trim()) {
+        textParts.push(value.content);
+      }
+      visit(value.content);
+      visit(value.contentItems);
+      visit(value.content_items);
+      visit(value.input);
+      visit(value.inputItems);
+      visit(value.input_items);
     }
+
+    visit(content);
     return { text: textParts.join("\n"), attachments: atts };
   }
 
@@ -1120,76 +1768,22 @@
     if (!thread) return;
     clearChat();
 
-    const turns = Array.isArray(thread.turns) ? thread.turns : [];
-    for (const turn of turns) {
-      const items = (turn && Array.isArray(turn.items) ? turn.items : []) || [];
-      for (const item of items) {
-        if (!item || typeof item !== "object") continue;
-        if (item.type === "userMessage") {
-          closeCommandGroup();
-          const parsed = parseUserContent(item.content);
-          addUserMessage(parsed.text, parsed.attachments);
-        } else if (item.type === "agentMessage") {
-          closeCommandGroup();
-          const row = addRowFromTemplate(tplAssistant);
-          const bubble = row.querySelector(".bubble");
-          if (item.html && typeof item.html === "string") renderHtmlInto(bubble, item.html);
-          else renderTextWithLinks(bubble, normalizeAssistantText(item.text || ""));
-        } else if (item.type === "plan") {
-          closeCommandGroup();
-          addSystemMessage("plan:\n" + (item.text || ""));
-        } else if (item.type === "reasoning") {
-          closeCommandGroup();
-          const s = Array.isArray(item.summary) ? item.summary.join("\n") : "";
-          addSystemMessage("reasoning summary:\n" + s);
-        } else if (item.type === "commandExecution") {
-          const id = String(item.id || "");
-          if (!id) {
-            closeCommandGroup();
-            const out = item.aggregatedOutput || "";
-            addSystemMessage("command:\n" + (item.command || "") + (out ? "\n\n" + out : ""));
-          } else {
-            const ui = ensureCommandExecutionUI(id);
-            if (ui.previewEl) ui.previewEl.textContent = clampPreview(item.command || "", 80);
-            if (ui.statusEl) ui.statusEl.textContent = String(item.status || "");
-            if (ui.outputEl) {
-              const out = item.aggregatedOutput || "";
-              const rendered = out ? `$ ${String(item.command || "").trim()}\n\n${out}` : `$ ${String(item.command || "").trim()}`;
-              renderTextWithLinks(ui.outputEl, rendered);
-            }
-          }
-        } else if (item.type === "fileChange") {
-          closeCommandGroup();
-          const id = String(item.id || "");
-          const changes = Array.isArray(item.changes) ? item.changes : [];
-          if (!id) {
-            const header = changes.map((c) => `${c.kind} ${c.path}`).join("\n");
-            addSystemMessage("file change:\n" + header);
-          } else {
-            const ui = ensureFileChangeUI(id);
-            if (ui.subEl) ui.subEl.textContent = `${changes.length} files`;
-            if (ui.countEl) ui.countEl.textContent = String(changes.length);
-            if (ui.bodyEl) {
-              renderFileChangesInto(
-                ui.bodyEl,
-                changes.map((c) => ({
-                  kind: String(c && c.kind ? c.kind : ""),
-                  path: String(c && c.path ? c.path : ""),
-                  diff: String(c && c.diff ? c.diff : "")
-                }))
-              );
-            }
-          }
-        } else if (item.type === "webSearch") {
-          closeCommandGroup();
-          addSystemMessage("web search:\n" + (item.query || ""));
-        } else {
-          closeCommandGroup();
-          addSystemMessage("item: " + item.type);
-        }
+    currentHistoryItems = flattenHistoryItems(thread);
+    reconcileOptimisticUserMessages(thread && thread.id ? thread.id : state && state.threadId ? state.threadId : "", currentHistoryItems);
+    const historyWindow = createThreadHistoryWindow(currentHistoryItems, visibleHistoryCount);
+    if (historyWindow.hiddenCount > 0) addHistoryLoadMoreRow(historyWindow.hiddenCount);
+    const shouldStickBottom = Math.abs(chat.scrollHeight - chat.scrollTop - chat.clientHeight) < 24;
+    historyRenderJob = renderQueue.createRenderQueue(historyWindow.items, (item) => {
+      renderThreadItem(item);
+    }, {
+      chunkSize: 20,
+      onDone() {
+        historyRenderJob = null;
+        renderOptimisticUserMessages(thread && thread.id ? thread.id : state && state.threadId ? state.threadId : "");
+        if (shouldStickBottom) scrollToBottom();
       }
-    }
-    scrollToBottom();
+    });
+    historyRenderJob.start();
   }
 
   function ensureAssistantRow(itemId) {
@@ -1356,10 +1950,11 @@
     }
   }
 
-  function fmtThreadLabel(t) {
-    const preview = (t.preview || "").replace(/\s+/g, " ").slice(0, 42);
-    const updated = t.updatedAt ? new Date(t.updatedAt * 1000).toLocaleString() : "";
-    return `${preview || t.id}${updated ? " · " + updated : ""}`;
+  function fmtThreadLabel(thread) {
+    const preview = getThreadPreview(thread).slice(0, 42);
+    const updatedAt = getThreadUpdatedAt(thread);
+    const updated = updatedAt ? new Date(updatedAt).toLocaleString() : "";
+    return `${preview || getThreadId(thread)}${updated ? " · " + updated : ""}`;
   }
 
   function resolveEffectiveModelId(s, models) {
@@ -1396,7 +1991,7 @@
     const list = Array.isArray(models) ? models : [];
     const m = list.find((x) => x && x.model === modelId) || null;
     if (m && typeof m.displayName === "string" && m.displayName) return m.displayName;
-    return modelId || "loading...";
+    return modelId || t("modelLoading");
   }
 
   function updateEffortOptions() {
@@ -1414,55 +2009,164 @@
           "high",
           "xhigh"
         ].map((v) => ({ value: v, label: v }));
-    setOptions(effortSelect, [{ value: "", label: "effort: default" }, ...opts], state.settings.effort || "");
+    setOptions(effortSelect, [{ value: "", label: t("effortDefault") }, ...opts], state.settings.effort || "");
+  }
+
+  function updateInstructionOptions(s) {
+    if (!s) return;
+    setOptions(
+      uiLocaleSelect,
+      [
+        { value: "ja", label: t("uiLocaleJa") },
+        { value: "en", label: t("uiLocaleEn") }
+      ],
+      (s.settings && s.settings.uiLocale) || uiLocale
+    );
+    setOptions(
+      collaborationModeSelect,
+      [{ value: "", label: t("collaborationDefault") }].concat(
+        (Array.isArray(s.collaborationModes) ? s.collaborationModes : []).map((mode) => {
+          const name = mode && typeof mode.name === "string" ? mode.name : "";
+          const model = mode && typeof mode.model === "string" ? mode.model : "";
+          const effort = mode && typeof mode.reasoning_effort === "string" ? mode.reasoning_effort : "";
+          const suffix = [model, effort].filter(Boolean).join(" / ");
+          return { value: name, label: suffix ? `${name} (${suffix})` : name };
+        })
+      ),
+      (s.settings && s.settings.collaborationMode) || ""
+    );
+    setOptions(
+      personalitySelect,
+      [
+        { value: "", label: t("personalityDefault") },
+        { value: "friendly", label: t("personalityFriendly") },
+        { value: "pragmatic", label: t("personalityPragmatic") },
+        { value: "none", label: t("personalityNone") }
+      ],
+      (s.settings && s.settings.personality) || ""
+    );
+  }
+
+  function applyLocale() {
+    document.documentElement.lang = uiLocale;
+    if (taskSettingsTitle) taskSettingsTitle.textContent = t("taskSettingsTitle");
+    if (runSettingsTitle) runSettingsTitle.textContent = t("runSettingsTitle");
+    if (projectInstructionsTitle) projectInstructionsTitle.textContent = t("projectInstructionsTitle");
+    if (projectInstructionsHelp) projectInstructionsHelp.textContent = t("projectInstructionsHelp");
+    if (baseInstructionsTitle) baseInstructionsTitle.textContent = t("baseInstructionsTitle");
+    if (baseInstructionsHelp) baseInstructionsHelp.textContent = t("baseInstructionsHelp");
+    if (sessionInstructionsTitle) sessionInstructionsTitle.textContent = t("sessionInstructionsTitle");
+    if (sessionInstructionsHelp) sessionInstructionsHelp.textContent = t("sessionInstructionsHelp");
+    if (modeInstructionsTitle) modeInstructionsTitle.textContent = t("modeInstructionsTitle");
+    if (modeInstructionsHelp) modeInstructionsHelp.textContent = t("modeInstructionsHelp");
+    if (taskListLabel) taskListLabel.textContent = t("taskPickerTitle");
+    if (taskSearch) taskSearch.placeholder = t("searchTasks");
+    if (input) input.placeholder = t("typeMessage");
+    if (baseInstructionsInput) baseInstructionsInput.placeholder = t("baseInstructionsPlaceholder");
+    if (developerInstructionsInput) developerInstructionsInput.placeholder = t("sessionInstructionsPlaceholder");
+    setButtonLabel(taskPickerButton, t("task"), t("taskPickerButton"));
+    setButtonLabel(openSettings, t("settings"));
+    setButtonLabel(taskClose, t("close"));
+    setButtonLabel(taskNew, t("newThread"));
+    setButtonLabel(taskArchive, t("archiveThread"));
+    setButtonLabel(newThreadBtn, t("newThread"));
+    setButtonLabel(forkThreadBtn, t("forkThread"));
+    setButtonLabel(rollback1Btn, t("rollbackTurn"));
+    setButtonLabel(archiveThreadBtn, t("archiveThread"));
+    setButtonLabel(unarchiveThreadBtn, t("unarchiveThread"));
+    setButtonLabel(saveBaseInstructionsBtn, t("saveBaseInstructions"));
+    setButtonLabel(clearBaseInstructionsBtn, t("clearBaseInstructions"));
+    setButtonLabel(saveDeveloperInstructionsBtn, t("saveSessionInstructions"));
+    setButtonLabel(clearDeveloperInstructionsBtn, t("clearSessionInstructions"));
+    setButtonLabel(saveInstructionModesBtn, t("saveModeSettings"));
+    setButtonLabel(clearInstructionModesBtn, t("clearModeSettings"));
+    setButtonLabel(openAgentsInstructionsBtn, t("openAgents"));
+    setButtonLabel(createAgentsInstructionsBtn, t("createAgents"));
+    setButtonLabel(attachFiles, t("attachFiles"));
+    if (toggleFullAccess) {
+      toggleFullAccess.title = t("toggleFullAccess");
+      toggleFullAccess.setAttribute("aria-label", t("toggleFullAccess"));
+    }
+    if (toggleApproval) {
+      toggleApproval.title = t("toggleApproval");
+      toggleApproval.setAttribute("aria-label", t("toggleApproval"));
+    }
+    if (send) {
+      const text = isBusy ? t("stop") : t("send");
+      send.title = text;
+      send.setAttribute("aria-label", text);
+    }
+    const wrapTitles = [
+      [document.getElementById("effortSelectWrap"), t("effortTitle")],
+      [document.getElementById("approvalSelectWrap"), t("approvalTitle")],
+      [document.getElementById("sandboxSelectWrap"), t("sandboxTitle")],
+      [document.getElementById("uiLocaleSelectWrap"), t("localeTitle")],
+      [document.getElementById("collaborationModeSelectWrap"), t("collaborationTitle")],
+      [document.getElementById("personalitySelectWrap"), t("personalityTitle")]
+    ];
+    for (const [el, title] of wrapTitles) {
+      if (!el) continue;
+      el.title = title;
+    }
+    renderAgentsInstructionsState(state);
   }
 
   function applyState(s) {
     const prevThreadId = state && state.threadId ? String(state.threadId) : null;
+    const effectiveSettings = mergeDisplayedAccessSettings(s && s.settings);
     state = s;
+    if (state && typeof state === "object") state.settings = effectiveSettings;
+    uiLocale = effectiveSettings && effectiveSettings.uiLocale ? String(effectiveSettings.uiLocale) : uiLocale;
     const models = (s.models || []).filter((m) => !m.hidden);
     const effectiveModelId = resolveEffectiveModelId(s, models);
     const effectiveModelLabel = resolveEffectiveModelLabel(models, effectiveModelId);
     setOptions(
       modelSelect,
       [{ value: "", label: `model: ${effectiveModelLabel}` }, ...models.map((m) => ({ value: m.model, label: m.displayName }))],
-      (s.settings && s.settings.model) || ""
+      (effectiveSettings && effectiveSettings.model) || ""
     );
+    applyLocale();
+    renderAgentsInstructionsState(s);
+    syncBaseInstructionsEditor(effectiveSettings && effectiveSettings.baseInstructions);
+    syncDeveloperInstructionsEditor(effectiveSettings && effectiveSettings.developerInstructions);
+    updateInstructionOptions(s);
 
     if (taskTitle) {
       const threads = Array.isArray(s.threads) ? s.threads : [];
-      const current = threads.find((t) => t && t.id === s.threadId) || threads[0] || null;
-      taskTitle.textContent = current ? taskDisplayTitle(current) : "タスク";
+      const current = threads.find((thread) => getThreadId(thread) === s.threadId) || threads[0] || null;
+      taskTitle.textContent = current ? taskDisplayTitle(current) : t("taskFallback");
     }
     if (isTaskPickerOpen()) renderTaskPicker();
 
     const nextThreadId = s && s.threadId ? String(s.threadId) : null;
     if (nextThreadId && nextThreadId !== prevThreadId) {
+      visibleHistoryCount = 120;
       if (prevThreadId) persistDraftNow(prevThreadId);
       restoreDraftForThread(nextThreadId);
     } else if (nextThreadId && !prevThreadId) {
+      visibleHistoryCount = 120;
       restoreDraftForThread(nextThreadId);
     }
 
     setOptions(
       approvalSelect,
       [
-        { value: "", label: "approval: default" },
+        { value: "", label: t("approvalDefault") },
         { value: "untrusted", label: "untrusted" },
         { value: "on-request", label: "on-request" },
         { value: "never", label: "never" }
       ],
-      (s.settings && s.settings.approvalPolicy) || ""
+      (effectiveSettings && effectiveSettings.approvalPolicy) || ""
     );
     setOptions(
       sandboxSelect,
       [
-        { value: "", label: "sandbox: default" },
+        { value: "", label: t("sandboxDefault") },
         { value: "read-only", label: "read-only" },
         { value: "workspace-write", label: "workspace-write" },
         { value: "danger-full-access", label: "danger-full-access" }
       ],
-      (s.settings && s.settings.sandbox) || ""
+      (effectiveSettings && effectiveSettings.sandbox) || ""
     );
 
     updateEffortOptions();
@@ -1470,18 +2174,22 @@
     status.textContent = s.connectionStatus || "ready";
 
     if (fullAccessLabel && toggleFullAccess) {
-      const sandbox = (s.settings && s.settings.sandbox) || null;
+      const sandbox = (effectiveSettings && effectiveSettings.sandbox) || null;
       const isFull = sandbox === "danger-full-access";
-      fullAccessLabel.textContent = isFull ? "フルアクセス" : "デフォルト";
+      fullAccessLabel.textContent = isFull ? t("fullAccess") : t("default");
+      toggleFullAccess.classList.toggle("is-default", !isFull);
       toggleFullAccess.classList.toggle("is-full", isFull);
+      toggleFullAccess.setAttribute("aria-pressed", isFull ? "true" : "false");
     }
 
     if (approvalLabel && toggleApproval) {
-      const approval = (s.settings && s.settings.approvalPolicy) || null;
+      const approval = (effectiveSettings && effectiveSettings.approvalPolicy) || null;
       const isNever = approval === "never";
       // "never" = no per-action prompts; others = may prompt.
-      approvalLabel.textContent = isNever ? "承認: なし" : "承認: あり";
+      approvalLabel.textContent = isNever ? t("approvalOff") : t("approvalOn");
+      toggleApproval.classList.toggle("is-on", !isNever);
       toggleApproval.classList.toggle("is-never", isNever);
+      toggleApproval.setAttribute("aria-pressed", isNever ? "true" : "false");
       toggleApproval.title = `approval: ${approval || "default"}`;
       toggleApproval.setAttribute("aria-label", `approval: ${approval || "default"}`);
     }
@@ -1490,20 +2198,54 @@
     serverBusy = Boolean(s && s.busy);
     setBusy(serverBusy && allowBusyUI);
 
-    const t = s.thread || null;
-    const updatedAt = t && typeof t.updatedAt === "number" ? t.updatedAt : null;
-    if ((s.threadId && s.threadId !== lastRendered.threadId) || (updatedAt && updatedAt !== lastRendered.updatedAt)) {
-      lastRendered = { threadId: s.threadId || null, updatedAt };
-      renderThread(t);
+    const threadData = s.thread || null;
+    const updatedAt = threadData && typeof threadData.updatedAt === "number" ? threadData.updatedAt : null;
+    const historySignature = threadData ? `${updatedAt === null ? "na" : updatedAt}:${getThreadHistorySignature(threadData)}` : null;
+    const renderedThreadId = s.threadId || null;
+    const threadChanged = renderedThreadId !== lastRendered.threadId;
+    const historyChanged = historySignature !== null && historySignature !== lastRendered.historySignature;
+    if (threadData && (threadChanged || historyChanged)) {
+      lastRendered = { threadId: renderedThreadId, updatedAt, historySignature };
+      renderThread(threadData);
+    } else if (!renderedThreadId) {
+      lastRendered = { threadId: null, updatedAt: null, historySignature: null };
+      clearChat();
     }
   }
 
   function applyAccessSettingsPatch(patch) {
     if (!state) return;
     const nextSettings = Object.assign({}, state.settings || {}, patch || {});
+    pendingAccessSettings = {
+      hasApprovalPolicy: Object.prototype.hasOwnProperty.call(patch || {}, "approvalPolicy"),
+      approvalPolicy: nextSettings.approvalPolicy || null,
+      hasSandbox: Object.prototype.hasOwnProperty.call(patch || {}, "sandbox"),
+      sandbox: nextSettings.sandbox || null
+    };
     // applyState() updates labels/selects consistently without re-rendering the thread,
     // unless threadId/updatedAt changed (they won't here).
     applyState(Object.assign({}, state, { settings: nextSettings }));
+  }
+
+  function mergeDisplayedAccessSettings(settings) {
+    const base = Object.assign({}, settings || {});
+    if (!pendingAccessSettings) return base;
+
+    const incomingApproval = Object.prototype.hasOwnProperty.call(base, "approvalPolicy") ? base.approvalPolicy || null : null;
+    const incomingSandbox = Object.prototype.hasOwnProperty.call(base, "sandbox") ? base.sandbox || null : null;
+    const pendingApproval = pendingAccessSettings.approvalPolicy || null;
+    const pendingSandbox = pendingAccessSettings.sandbox || null;
+
+    const approvalSettled = !pendingAccessSettings.hasApprovalPolicy || incomingApproval === pendingApproval;
+    const sandboxSettled = !pendingAccessSettings.hasSandbox || incomingSandbox === pendingSandbox;
+    if (approvalSettled && sandboxSettled) {
+      pendingAccessSettings = null;
+      return base;
+    }
+
+    if (pendingAccessSettings.hasApprovalPolicy) base.approvalPolicy = pendingApproval;
+    if (pendingAccessSettings.hasSandbox) base.sandbox = pendingSandbox;
+    return base;
   }
 
   function windowDurationMins(w) {
@@ -1622,14 +2364,20 @@
     }
 
     rateFooter.textContent = "";
-    if (ordered.length === 0) return;
+    if (ordered.length === 0) {
+      const b = document.createElement("div");
+      b.className = "badge";
+      b.textContent = t("rateLoading");
+      rateFooter.appendChild(b);
+      return;
+    }
 
     for (const it of ordered) {
       const b = document.createElement("div");
       b.className = "badge";
-      const label = it.label === "5h" ? "5hour" : it.label === "week" ? "Weekly" : it.label;
+      const label = it.label === "5h" ? t("rate5h") : it.label === "week" ? t("rateWeek") : it.label;
       const shown = fmtPercent(it.remaining);
-      b.textContent = `${label} 残り ${shown === null ? "?" : shown}%`;
+      b.textContent = `${label} ${t("rateRemaining")} ${shown === null ? "?" : shown}%`;
       const parts = [];
       if (it.limitId) parts.push(`limitId=${it.limitId}`);
       if (it.limitName) parts.push(`limitName=${it.limitName}`);
@@ -1759,6 +2507,17 @@
     });
   }
 
+  if (uiLocaleSelect) uiLocaleSelect.addEventListener("change", () => {
+    const locale = uiLocaleSelect.value || "ja";
+    uiLocale = locale === "en" ? "en" : "ja";
+    if (!state) state = { settings: {} };
+    state.settings = Object.assign({}, state.settings || {}, { uiLocale });
+    applyLocale();
+    updateInstructionOptions(state);
+    updateEffortOptions();
+    vscode.postMessage({ type: "setUiLocale", locale: uiLocale });
+  });
+
   if (modelSelect) modelSelect.addEventListener("change", () => {
     const model = modelSelect.value || null;
     if (!state) state = { settings: {} };
@@ -1781,7 +2540,7 @@
     const sandbox = (sandboxSelect.value || null);
     if (!state) state = { settings: {} };
     state.settings = state.settings || {};
-    state.settings.approvalPolicy = approvalPolicy;
+    applyAccessSettingsPatch({ approvalPolicy, sandbox });
     vscode.postMessage({ type: "setAccessSettings", approvalPolicy, sandbox });
   });
 
@@ -1790,8 +2549,54 @@
     const approvalPolicy = (approvalSelect.value || null);
     if (!state) state = { settings: {} };
     state.settings = state.settings || {};
-    state.settings.sandbox = sandbox;
+    applyAccessSettingsPatch({ approvalPolicy, sandbox });
     vscode.postMessage({ type: "setAccessSettings", approvalPolicy, sandbox });
+  });
+
+  if (saveBaseInstructionsBtn) saveBaseInstructionsBtn.addEventListener("click", () => {
+    submitInstructionSettings({});
+  });
+
+  if (clearBaseInstructionsBtn) clearBaseInstructionsBtn.addEventListener("click", () => {
+    submitInstructionSettings({ baseInstructions: null });
+  });
+
+  if (saveDeveloperInstructionsBtn) saveDeveloperInstructionsBtn.addEventListener("click", () => {
+    submitInstructionSettings({});
+  });
+
+  if (clearDeveloperInstructionsBtn) clearDeveloperInstructionsBtn.addEventListener("click", () => {
+    submitInstructionSettings({ developerInstructions: null });
+  });
+
+  if (saveInstructionModesBtn) saveInstructionModesBtn.addEventListener("click", () => {
+    submitInstructionSettings({});
+  });
+
+  if (clearInstructionModesBtn) clearInstructionModesBtn.addEventListener("click", () => {
+    submitInstructionSettings({ personality: null, collaborationMode: null });
+  });
+
+  if (baseInstructionsInput) baseInstructionsInput.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+      e.preventDefault();
+      submitInstructionSettings({});
+    }
+  });
+
+  if (developerInstructionsInput) developerInstructionsInput.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+      e.preventDefault();
+      submitInstructionSettings({});
+    }
+  });
+
+  if (openAgentsInstructionsBtn) openAgentsInstructionsBtn.addEventListener("click", () => {
+    vscode.postMessage({ type: "openAgentsInstructions" });
+  });
+
+  if (createAgentsInstructionsBtn) createAgentsInstructionsBtn.addEventListener("click", () => {
+    vscode.postMessage({ type: "createAgentsInstructions" });
   });
 
   if (taskPickerButton) taskPickerButton.addEventListener("click", (e) => {
@@ -1825,7 +2630,7 @@
     e.preventDefault();
     e.stopPropagation();
     if (!state || !state.threadId) return;
-    const ok = confirm("このタスクを閉じますか？（アーカイブ）");
+    const ok = confirm(t("taskArchiveConfirm"));
     if (!ok) return;
     vscode.postMessage({ type: "archiveThread", threadId: state.threadId });
     setTaskPickerOpen(false);
@@ -1930,7 +2735,13 @@
     }
 
     if (msg.type === "userMessage") {
-      addUserMessage(msg.text, Array.isArray(msg.attachments) ? msg.attachments : []);
+      const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
+      optimisticUserMessages.push({
+        threadId: state && state.threadId ? String(state.threadId) : "",
+        text: String(msg.text || ""),
+        attachments
+      });
+      addUserMessage(msg.text, attachments);
       return;
     }
 
@@ -2110,7 +2921,7 @@
       const ui = ensureCommandExecutionUI(msg.itemId);
       if (ui.detailsEl) ui.detailsEl.classList.add("pending");
       if (ui.previewEl) ui.previewEl.textContent = clampPreview(msg.command || "", 80);
-      if (ui.statusEl) ui.statusEl.textContent = "running";
+      if (ui.statusEl) ui.statusEl.textContent = t("runningCommand");
       activeCommand = { itemId: msg.itemId, command: String(msg.command || "") };
       renderActivityIndicator();
       scrollToBottom();
@@ -2125,7 +2936,7 @@
       closeCommandGroup();
       const ui = ensureFileChangeUI(msg.itemId);
       if (ui.detailsEl) ui.detailsEl.classList.add("pending");
-      if (ui.subEl) ui.subEl.textContent = "編集中…";
+      if (ui.subEl) ui.subEl.textContent = t("editingFiles");
       activeFileChange = { itemId: msg.itemId };
       renderActivityIndicator();
       scrollToBottom();
@@ -2157,5 +2968,6 @@
     if (document.visibilityState === "hidden") persistDraftNow();
   });
 
+  applyLocale();
   vscode.postMessage({ type: "init" });
 })();

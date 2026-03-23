@@ -468,6 +468,52 @@ vscode-option[aria-selected="true"] {
   gap: 8px;
 }
 
+.settings-group-wide {
+  grid-column: 1 / -1;
+}
+
+.settings-textarea {
+  min-height: 132px;
+  max-height: 240px;
+  font-family: var(--vscode-editor-font-family);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.settings-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.settings-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
+}
+
+.settings-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings-card-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.settings-help {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 .chat {
   flex: 1;
   overflow-y: auto;
@@ -906,20 +952,66 @@ pre.diff {
   background: transparent;
   color: var(--fg);
   cursor: pointer;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease,
+    box-shadow 120ms ease,
+    color 120ms ease,
+    transform 120ms ease;
+}
+
+.meta-btn .ico,
+.meta-btn .meta-btn-text {
+  transition:
+    color 120ms ease,
+    opacity 120ms ease;
 }
 
 .meta-btn:hover {
   background: color-mix(in srgb, var(--fg) 6%, transparent);
 }
 
+.meta-btn.is-default {
+  border-color: var(--border);
+  background-color: transparent;
+  box-shadow: none;
+}
+
 .meta-btn.is-full {
-  border-color: color-mix(in srgb, #f85149 40%, var(--border));
-  background: color-mix(in srgb, #f85149 12%, transparent);
+  border-color: #f85149;
+  background-color: rgba(248, 81, 73, 0.28);
+  box-shadow:
+    inset 0 0 0 1px rgba(248, 81, 73, 0.26),
+    0 0 0 3px rgba(248, 81, 73, 0.14);
+  color: color-mix(in srgb, var(--fg) 82%, white);
+  transform: translateY(-1px);
+}
+
+.meta-btn.is-on {
+  border-color: var(--border);
+  background-color: transparent;
+  box-shadow: none;
 }
 
 .meta-btn.is-never {
-  border-color: color-mix(in srgb, #3fb950 40%, var(--border));
-  background: color-mix(in srgb, #3fb950 12%, transparent);
+  border-color: #3fb950;
+  background-color: rgba(63, 185, 80, 0.28);
+  box-shadow:
+    inset 0 0 0 1px rgba(63, 185, 80, 0.24),
+    0 0 0 3px rgba(63, 185, 80, 0.12);
+  color: color-mix(in srgb, var(--fg) 82%, white);
+  transform: translateY(-1px);
+}
+
+.meta-btn.is-full .ico,
+.meta-btn.is-full .meta-btn-text,
+.meta-btn.is-never .ico,
+.meta-btn.is-never .meta-btn-text {
+  color: inherit;
+}
+
+.meta-btn[aria-pressed="true"] {
+  font-weight: 600;
 }
 
 .meta-btn-text {
