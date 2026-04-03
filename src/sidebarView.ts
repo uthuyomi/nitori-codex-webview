@@ -6,9 +6,9 @@ export class NitoriCodexSidebarViewProvider implements vscode.WebviewViewProvide
 
   private view: vscode.WebviewView | null = null;
   private readonly extensionUri: vscode.Uri;
-  private readonly onWebviewReady: (webview: vscode.Webview) => void;
+  private readonly onWebviewReady: (view: vscode.WebviewView) => void;
 
-  constructor(extensionUri: vscode.Uri, onWebviewReady: (webview: vscode.Webview) => void) {
+  constructor(extensionUri: vscode.Uri, onWebviewReady: (view: vscode.WebviewView) => void) {
     this.extensionUri = extensionUri;
     this.onWebviewReady = onWebviewReady;
   }
@@ -20,7 +20,6 @@ export class NitoriCodexSidebarViewProvider implements vscode.WebviewViewProvide
       localResourceRoots: [this.extensionUri]
     };
     webviewView.webview.html = getWebviewHtml(webviewView.webview, this.extensionUri);
-    this.onWebviewReady(webviewView.webview);
+    this.onWebviewReady(webviewView);
   }
 }
-

@@ -80,7 +80,7 @@ export class AppStateCache {
 
     const [modelsRes, threadsRes, rateRes, collaborationModesRes, configRes] = await Promise.all([
       client.request("model/list", { limit: 200, includeHidden: false }),
-      client.request("thread/list", { limit: 50 }),
+      client.request("thread/list", { limit: 200 }),
       client.request("account/rateLimits/read"),
       client.request("collaborationMode/list").catch(() => ({ data: [] })),
       client.request("config/read", { includeLayers: false, cwd }).catch(() => null)

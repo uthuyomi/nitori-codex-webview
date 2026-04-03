@@ -34,12 +34,17 @@
   const sessionInstructionsHelp = document.getElementById("sessionInstructionsHelp");
   const modeInstructionsTitle = document.getElementById("modeInstructionsTitle");
   const modeInstructionsHelp = document.getElementById("modeInstructionsHelp");
-  const taskPickerButton = document.getElementById("taskPickerButton");
+  const homeButton = document.getElementById("homeButton");
   const taskPop = document.getElementById("taskPop");
+  const chatPage = document.getElementById("chatPage");
   const taskSearch = document.getElementById("taskSearch");
   const taskArchive = document.getElementById("taskArchive");
   const taskList = document.getElementById("taskList");
   const taskTitle = document.getElementById("taskTitle");
+  const taskSubtitle = document.getElementById("taskSubtitle");
+  const chatEmpty = document.getElementById("chatEmpty");
+  const homeStats = document.getElementById("homeStats");
+  const homeButtonIconUse = document.getElementById("homeButtonIconUse");
   const taskClose = document.getElementById("taskClose");
   const taskNew = document.getElementById("taskNew");
   const taskListLabel = document.getElementById("taskListLabel");
@@ -58,8 +63,10 @@
   const activityKind = document.getElementById("activityKind");
   const activityCwd = document.getElementById("activityCwd");
   const activityDetail = document.getElementById("activityDetail");
+  const noticeStack = document.getElementById("noticeStack");
   const rateFooter = document.getElementById("rateFooter");
   const sendIconUse = document.getElementById("sendIconUse");
+  const personaSettingsLocked = true;
 
   const tplUser = document.getElementById("msg-user");
   const tplAssistant = document.getElementById("msg-assistant");
@@ -85,6 +92,7 @@
   }
 
   const assistantByItemId = new Map();
+  const assistantHtmlByItemId = new Map();
   const systemByItemId = new Map();
   const systemKindByItemId = new Map();
   const commandUIByItemId = new Map();
@@ -92,6 +100,9 @@
   let lastTurnDiff = "";
   let state = null;
   let lastRendered = { threadId: null, updatedAt: null, historySignature: null };
+  let lastTaskSummarySignature = "";
+  let currentPage = "home";
+  let showArchivedTasks = false;
   let attachments = [];
   const previewByPath = new Map(); // path -> dataUrl|null
   const previewReqById = new Map(); // requestId -> path
@@ -113,14 +124,19 @@
   let taskQuery = "";
   let activeCommand = null;
   let activeFileChange = null;
+  let liveAssistantPreview = null; // { itemId, text, html, pending }
+  let liveAssistantRow = null;
   let stickyActivity = null; // { kind, kindLabel, detailText, untilMs }
   let lastActivityKey = "";
   let uiLocale = "ja";
-  let visibleHistoryCount = 120;
+  const DEFAULT_VISIBLE_HISTORY_COUNT = Number.MAX_SAFE_INTEGER;
+  let visibleHistoryCount = DEFAULT_VISIBLE_HISTORY_COUNT;
   let currentHistoryItems = [];
   let historyRenderJob = null;
   let pendingAccessSettings = null;
-  let optimisticUserMessages = [];
+  let optimisticUserMessagesByThreadId = {};
+  let optimisticUserRowsByThreadId = {};
+  let queuedFollowUpsByThreadId = {};
   let persisted = vscode.getState() || {};
   let draftsByThreadId =
     persisted && typeof persisted === "object" && persisted.draftsByThreadId && typeof persisted.draftsByThreadId === "object"
@@ -128,6 +144,7 @@
       : {};
   let draftSaveTimer = null;
   let shikiStyleEl = null;
+  let noticeSeq = 1;
   const cspNonce = (() => {
     try {
       const s = document.querySelector("script[nonce]");
@@ -179,18 +196,29 @@
   }
 
   function getThreadHistorySignature(thread) {
-    if (threadHistory && typeof threadHistory.getHistorySignature === "function") {
-      try {
-        return String(threadHistory.getHistorySignature(thread) || "0");
-      } catch (error) {
-        console.warn("threadHistory.getHistorySignature failed", error);
-      }
-    }
-
     const items = flattenHistoryItems(thread);
     if (!items.length) return "0";
-    const last = items[items.length - 1];
-    return `${items.length}:${String(last && last.type ? last.type : "")}:${String(last && last.id ? last.id : "")}`;
+    let hash = 2166136261;
+    function push(part) {
+      const text = String(part || "");
+      for (let i = 0; i < text.length; i += 1) {
+        hash ^= text.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+      }
+    }
+    for (const item of items) {
+      if (!item || typeof item !== "object") continue;
+      const content = normalizeAssistantText(item.text || item.message || "");
+      const aggregatedOutput = typeof item.aggregatedOutput === "string" ? item.aggregatedOutput : "";
+      const changes = Array.isArray(item.changes) ? item.changes.length : 0;
+      push(item.id || "");
+      push(item.type || "");
+      push(item.status || "");
+      push(content.length);
+      push(aggregatedOutput.length);
+      push(changes);
+    }
+    return `${items.length}:${hash >>> 0}`;
   }
 
   function createThreadHistoryWindow(items, count) {
@@ -206,6 +234,29 @@
     const safe = Array.isArray(items) ? items : [];
     const start = Math.max(0, safe.length - Math.max(0, Number(count) || 0));
     return { totalItems: safe.length, hiddenCount: start, items: safe.slice(start) };
+  }
+
+  function getRenderableTurns(thread) {
+    if (threadHistory && typeof threadHistory.getRenderableTurns === "function") {
+      try {
+        const turns = threadHistory.getRenderableTurns(thread);
+        return Array.isArray(turns) ? turns : [];
+      } catch (error) {
+        console.warn("threadHistory.getRenderableTurns failed", error);
+      }
+    }
+
+    const items = flattenHistoryItems(thread);
+    if (!items.length) return [];
+    return [
+      {
+        preUserItems: [],
+        userItems: [],
+        agentItems: items,
+        assistantItem: null,
+        postAssistantItems: []
+      }
+    ];
   }
   const renderQueue = window.__NITORI_RENDER_QUEUE__ || {
     createRenderQueue(items, renderItem, options) {
@@ -254,18 +305,20 @@
       sessionInstructionsTitle: "Session Instructions",
       sessionInstructionsHelp: "今回の作業だけに効かせたい追加指示を書きます。thread の start・resume・fork 時に developerInstructions として送ります。",
       modeInstructionsTitle: "組み込みモード",
-      modeInstructionsHelp: "Collaboration Mode は Codex の組み込み作業方針を選びます。Personality は thread と次の turn の応答スタイルを調整します。",
+      modeInstructionsHelp: "このビルドでは口調と人格は固定です。Collaboration Mode と Personality は変更できません。",
       saveBaseInstructions: "Base Instructions を保存",
       clearBaseInstructions: "Base Instructions をクリア",
       saveSessionInstructions: "Session Instructions を保存",
       clearSessionInstructions: "Session Instructions をクリア",
       saveModeSettings: "モード設定を保存",
       clearModeSettings: "モード設定をクリア",
-      newThread: "新規スレッド",
-      forkThread: "スレッドを Fork",
+      personaLockedHelp: "このビルドでは、にとり口調はロジックに固定されており変更できません。",
+      personaLockedLabel: "固定口調",
+      newThread: "新規タスク",
+      forkThread: "タスクを Fork",
       rollbackTurn: "1ターン戻す",
-      archiveThread: "スレッドをアーカイブ",
-      unarchiveThread: "アーカイブ解除",
+      archiveThread: "タスクをアーカイブ",
+      unarchiveThread: "タスクのアーカイブ解除",
       openAgents: "AGENTS.md を開く",
       createAgents: "AGENTS.md を作成",
       attachFiles: "ファイルを添付",
@@ -287,7 +340,16 @@
       taskArchiveConfirm: "このタスクをアーカイブしますか？",
       taskFallback: "タスク",
       taskFallbackUntitled: "無題タスク",
+      taskSectionToday: "今日",
+      taskSectionYesterday: "昨日",
+      taskSectionEarlier: "それ以前",
+      taskSectionUndated: "日付不明",
+      pastMessages: "件の過去のメッセージ",
+      finalMessage: "最終メッセージ",
+      exploredSteps: "件の実装過程",
       thinking: "思考中",
+      exploring: "調査中",
+      planning: "計画中",
       editingFiles: "ファイル編集中",
       runningCommand: "コマンド実行中",
       noWorkspaceFolder: "(ワークスペースなし)",
@@ -332,18 +394,20 @@
       sessionInstructionsTitle: "Session Instructions",
       sessionInstructionsHelp: "Use this for temporary guidance for the current task. It is sent as developerInstructions when a thread starts, resumes, or forks.",
       modeInstructionsTitle: "Built-in Modes",
-      modeInstructionsHelp: "Collaboration Mode chooses Codex built-in working instructions. Personality adjusts the response tone for the thread and the next turn.",
+      modeInstructionsHelp: "This build locks the assistant voice. Collaboration Mode and Personality cannot be changed.",
       saveBaseInstructions: "Save base instructions",
       clearBaseInstructions: "Clear base instructions",
       saveSessionInstructions: "Save session instructions",
       clearSessionInstructions: "Clear session instructions",
       saveModeSettings: "Save mode settings",
       clearModeSettings: "Clear mode settings",
-      newThread: "New thread",
-      forkThread: "Fork thread",
+      personaLockedHelp: "This build hard-locks the Nitori persona in logic, so these settings cannot be changed.",
+      personaLockedLabel: "Locked persona",
+      newThread: "New task",
+      forkThread: "Fork task",
       rollbackTurn: "Rollback one turn",
-      archiveThread: "Archive thread",
-      unarchiveThread: "Unarchive thread",
+      archiveThread: "Archive task",
+      unarchiveThread: "Unarchive task",
       openAgents: "Open AGENTS.md",
       createAgents: "Create AGENTS.md",
       attachFiles: "Attach files",
@@ -365,7 +429,16 @@
       taskArchiveConfirm: "Archive this task?",
       taskFallback: "Task",
       taskFallbackUntitled: "Untitled task",
+      taskSectionToday: "Today",
+      taskSectionYesterday: "Yesterday",
+      taskSectionEarlier: "Earlier",
+      taskSectionUndated: "No date",
+      pastMessages: "past messages",
+      finalMessage: "Final message",
+      exploredSteps: "process steps",
       thinking: "Thinking",
+      exploring: "Exploring",
+      planning: "Planning",
       editingFiles: "Editing files",
       runningCommand: "Running command",
       noWorkspaceFolder: "(no workspace folder)",
@@ -561,6 +634,70 @@
     if (!el) return;
     el.innerHTML = String(html || "");
     linkifyDom(el);
+    bindShikiCopyButtons(el);
+  }
+
+  function decodeBase64Utf8(value) {
+    try {
+      const binary = atob(String(value || ""));
+      const bytes = Uint8Array.from(binary, (ch) => ch.charCodeAt(0));
+      return new TextDecoder().decode(bytes);
+    } catch {
+      return "";
+    }
+  }
+
+  async function copyTextToClipboard(text) {
+    const content = String(text || "");
+    if (!content) return false;
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+        await navigator.clipboard.writeText(content);
+        return true;
+      }
+    } catch {
+      // fallback below
+    }
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = content;
+      ta.setAttribute("readonly", "true");
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      ta.style.pointerEvents = "none";
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      return Boolean(ok);
+    } catch {
+      return false;
+    }
+  }
+
+  function bindShikiCopyButtons(rootEl) {
+    if (!rootEl || typeof rootEl.querySelectorAll !== "function") return;
+    const buttons = rootEl.querySelectorAll(".shiki-copy-button");
+    for (const button of buttons) {
+      if (button.dataset.copyBound === "true") continue;
+      button.dataset.copyBound = "true";
+      button.addEventListener("click", async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const code = decodeBase64Utf8(button.dataset.codeB64 || "");
+        const ok = await copyTextToClipboard(code);
+        if (ok) {
+          showUiNotice("コードをコピーした", { kind: "notice", ttlMs: 1800 });
+          button.textContent = "Copied";
+          setTimeout(() => {
+            button.textContent = "Copy";
+          }, 1200);
+        } else {
+          showUiNotice("コードのコピーに失敗", { kind: "error", ttlMs: 2600 });
+        }
+      });
+    }
   }
 
   function isImagePath(p) {
@@ -592,7 +729,7 @@
     if (!file) return;
     const maxBytes = 6 * 1024 * 1024;
     if (typeof file.size === "number" && file.size > maxBytes) {
-      addSystemMessage(`添付が大きすぎます（最大 ${maxBytes} bytes）: ${file.name || "file"}`);
+    showUiNotice(`添付が大きすぎる（最大 ${maxBytes} bytes）: ${file.name || "file"}`, { kind: "error", ttlMs: 4200 });
       return;
     }
     try {
@@ -603,7 +740,7 @@
         files: [{ name: file.name || "file", mime: file.type || "", dataBase64 }]
       });
     } catch {
-      addSystemMessage(`添付の読み込みに失敗しました: ${file.name || "file"}`);
+    showUiNotice(`添付の読み込みに失敗: ${file.name || "file"}`, { kind: "error", ttlMs: 4200 });
     }
   }
 
@@ -691,21 +828,62 @@
     return settingsPop && !settingsPop.hidden;
   }
 
-  function setTaskPickerOpen(open) {
-    if (!taskPop) return;
-    taskPop.hidden = !open;
-    if (open) {
+  function setCurrentPage(page, options) {
+    const nextPage = page === "chat" ? "chat" : "home";
+    currentPage = nextPage;
+    document.body.classList.toggle("is-home", nextPage === "home");
+    document.body.classList.toggle("is-chat", nextPage === "chat");
+    if (taskPop) taskPop.hidden = nextPage !== "home";
+    if (chatPage) chatPage.hidden = nextPage !== "chat";
+    const canReturnToChat = Boolean(state && state.threadId);
+    if (taskClose) {
+      taskClose.hidden = !canReturnToChat;
+      taskClose.disabled = !canReturnToChat;
+    }
+    if (homeButton) {
+      homeButton.hidden = nextPage !== "chat";
+      homeButton.title = t("close");
+      homeButton.setAttribute("aria-label", t("close"));
+    }
+    if (homeButtonIconUse) {
+      homeButtonIconUse.setAttribute("href", "#ico-back");
+    }
+    if (nextPage === "home") {
       renderTaskPicker();
-      if (taskSearch) {
+      if (!(options && options.skipFocus) && taskSearch) {
         taskSearch.value = taskQuery;
         taskSearch.focus();
         taskSearch.select();
       }
     }
+    if (chatEmpty) chatEmpty.hidden = !(nextPage === "chat" && !(state && state.threadId));
+    refreshHeaderCopy();
+  }
+
+  function refreshHeaderCopy() {
+    if (!taskTitle) return;
+    const tasks = Array.isArray(state && state.tasks) ? state.tasks : Array.isArray(state && state.threads) ? state.threads : [];
+    const current = tasks.find((thread) => getThreadId(thread) === (state && state.threadId ? state.threadId : "")) || null;
+    taskTitle.textContent = currentPage === "home" ? "Tasks" : current ? taskDisplayTitle(current) : t("taskFallback");
+    if (!taskSubtitle) return;
+    if (currentPage === "home") {
+      taskSubtitle.textContent = showArchivedTasks ? "Recent + archived tasks" : "Recent tasks";
+      return;
+    }
+    taskSubtitle.textContent = "";
+  }
+
+  function formatStatusText(statusValue, messageValue) {
+    const base = String(statusValue || "ready").trim() || "ready";
+    const extra = String(messageValue || "")
+      .replace(/\bthread=[^\s]+/gi, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    return extra ? `${base}: ${extra}` : base;
   }
 
   function isTaskPickerOpen() {
-    return taskPop && !taskPop.hidden;
+    return currentPage === "home";
   }
 
   function relTime(updatedAtSec) {
@@ -746,6 +924,7 @@
   }
 
   function submitInstructionSettings(overrides) {
+    if (personaSettingsLocked) return;
     const rawBaseValue =
       overrides && Object.prototype.hasOwnProperty.call(overrides, "baseInstructions")
         ? overrides.baseInstructions
@@ -837,6 +1016,13 @@
     return n > 1_000_000_000_000 ? n : n * 1000;
   }
 
+  function getTasks() {
+    if (!state || typeof state !== "object") return [];
+    const tasks = Array.isArray(state.tasks) ? state.tasks : null;
+    if (tasks) return tasks;
+    return Array.isArray(state.threads) ? state.threads : [];
+  }
+
   function getThreadId(thread) {
     if (!thread || typeof thread !== "object") return "";
     const candidates = [thread.id, thread.threadId, thread.thread_id];
@@ -855,6 +1041,62 @@
     return "";
   }
 
+  function stripMarkdownLinks(text) {
+    return String(text || "").replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
+  }
+
+  function extractTaskTitleFromPrompt(text) {
+    const normalized = stripMarkdownLinks(String(text || "")).replace(/\s+/g, " ").trim();
+    if (!normalized) return "";
+    const firstSentence = normalized.split(/(?<=[.!?。！？])\s+/)[0] || normalized;
+    const compact = firstSentence.trim() || normalized;
+    return compact.length > 80 ? compact.slice(0, 79).trimEnd() + "…" : compact;
+  }
+
+  function collectTextInputParts(value, out, seen) {
+    if (value == null) return;
+    if (typeof value === "string") {
+      if (value.trim()) out.push(value);
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const entry of value) collectTextInputParts(entry, out, seen);
+      return;
+    }
+    if (typeof value !== "object") return;
+    if (seen.has(value)) return;
+    seen.add(value);
+
+    const type = String(value.type || "")
+      .trim()
+      .toLowerCase();
+    if ((type === "text" || type === "input_text") && typeof value.text === "string" && value.text.trim()) {
+      out.push(value.text);
+    }
+    if (typeof value.message === "string" && value.message.trim()) out.push(value.message);
+    if (typeof value.content === "string" && value.content.trim()) out.push(value.content);
+    collectTextInputParts(value.input, out, seen);
+    collectTextInputParts(value.content, out, seen);
+    collectTextInputParts(value.items, out, seen);
+  }
+
+  function getThreadPromptTitle(thread) {
+    if (!thread || typeof thread !== "object") return "";
+    const turns = Array.isArray(thread.turns) ? thread.turns : [];
+    const firstTurn = turns[0];
+    if (!firstTurn || typeof firstTurn !== "object") return "";
+    const parts = [];
+    const seen = new Set();
+    collectTextInputParts(firstTurn.input, parts, seen);
+    collectTextInputParts(firstTurn.inputMessage, parts, seen);
+    collectTextInputParts(firstTurn.input_message, parts, seen);
+    collectTextInputParts(firstTurn.userInput, parts, seen);
+    collectTextInputParts(firstTurn.user_input, parts, seen);
+    collectTextInputParts(firstTurn.content, parts, seen);
+    const prompt = parts.join(" ").trim();
+    return extractTaskTitleFromPrompt(prompt);
+  }
+
   function getThreadCwd(thread) {
     if (!thread || typeof thread !== "object") return "";
     const candidates = [thread.cwd, thread.path, thread.workspacePath];
@@ -862,6 +1104,13 @@
       if (typeof candidate === "string" && candidate.trim()) return candidate;
     }
     return "";
+  }
+
+  function getThreadRepoLabel(thread) {
+    const cwd = getThreadCwd(thread);
+    if (!cwd) return "";
+    const parts = cwd.split(/[\\/]/).filter(Boolean);
+    return parts.length > 0 ? parts[parts.length - 1] : cwd;
   }
 
   function getThreadUpdatedAt(thread) {
@@ -875,61 +1124,232 @@
   }
 
   function taskDisplayTitle(thread) {
+    const explicitTitle = stripMarkdownLinks(
+      typeof (thread && (thread.title || thread.label)) === "string" ? String(thread.title || thread.label) : ""
+    )
+      .replace(/\s+/g, " ")
+      .trim();
+    const promptTitle = getThreadPromptTitle(thread);
     const preview = getThreadPreview(thread);
-    return preview || getThreadId(thread) || t("taskFallbackUntitled");
+    return explicitTitle || promptTitle || preview || getThreadId(thread) || t("taskFallbackUntitled");
+  }
+
+  function compareThreadsByUpdatedAtDesc(left, right) {
+    const leftUpdatedAt = getThreadUpdatedAt(left) || 0;
+    const rightUpdatedAt = getThreadUpdatedAt(right) || 0;
+    if (leftUpdatedAt !== rightUpdatedAt) return rightUpdatedAt - leftUpdatedAt;
+    return taskDisplayTitle(left).localeCompare(taskDisplayTitle(right), undefined, { sensitivity: "base" });
+  }
+
+  function buildTaskSearchCandidate(thread) {
+    const title = taskDisplayTitle(thread);
+    const cwd = getThreadCwd(thread);
+    const preview = getThreadPreview(thread);
+    const repoLabel = getThreadRepoLabel(thread) || cwd;
+    return {
+      thread,
+      title,
+      cwd,
+      preview,
+      repoLabel,
+      updatedAt: getThreadUpdatedAt(thread) || 0,
+      normalizedTitle: title.toLocaleLowerCase(),
+      normalizedRepoLabel: String(repoLabel || "").toLocaleLowerCase(),
+      normalizedCwd: String(cwd || "").toLocaleLowerCase(),
+      normalizedPreview: String(preview || "").toLocaleLowerCase(),
+      normalizedSearchText: [title, repoLabel, cwd, preview].join(" ").toLocaleLowerCase()
+    };
+  }
+
+  function getTaskSearchTokens(query) {
+    return String(query || "")
+      .toLocaleLowerCase()
+      .trim()
+      .split(/\s+/)
+      .filter((token) => token.length > 0);
+  }
+
+  function getTokenMatch(value, token) {
+    if (!value || !token) return null;
+    if (value === token) return { matchKind: 0, gapCount: 0, startIndex: 0 };
+    if (value.startsWith(token)) return { matchKind: 1, gapCount: 0, startIndex: 0 };
+    const substringIndex = value.indexOf(token);
+    if (substringIndex !== -1) return { matchKind: 2, gapCount: 0, startIndex: substringIndex };
+
+    let valueIndex = 0;
+    let startIndex = -1;
+    let previousMatchIndex = -1;
+    let gapCount = 0;
+    for (const character of token) {
+      const nextIndex = value.indexOf(character, valueIndex);
+      if (nextIndex === -1) return null;
+      if (startIndex === -1) startIndex = nextIndex;
+      if (previousMatchIndex !== -1) gapCount += nextIndex - previousMatchIndex - 1;
+      previousMatchIndex = nextIndex;
+      valueIndex = nextIndex + 1;
+    }
+    return { matchKind: 3, gapCount, startIndex };
+  }
+
+  function getFieldMatch(value, searchTokens, fieldPriority) {
+    if (!value || searchTokens.length === 0) return null;
+    let worstMatchKind = 0;
+    let totalGapCount = 0;
+    let firstStartIndex = Number.POSITIVE_INFINITY;
+
+    for (const token of searchTokens) {
+      const match = getTokenMatch(value, token);
+      if (!match) return null;
+      worstMatchKind = Math.max(worstMatchKind, match.matchKind);
+      totalGapCount += match.gapCount;
+      firstStartIndex = Math.min(firstStartIndex, match.startIndex);
+    }
+
+    return {
+      fieldPriority,
+      matchKind: worstMatchKind,
+      gapCount: totalGapCount,
+      startIndex: firstStartIndex
+    };
+  }
+
+  function compareTaskSearchMatch(left, right) {
+    const fieldPriorityDiff = left.fieldPriority - right.fieldPriority;
+    if (fieldPriorityDiff !== 0) return fieldPriorityDiff;
+    const matchKindDiff = left.matchKind - right.matchKind;
+    if (matchKindDiff !== 0) return matchKindDiff;
+    const gapCountDiff = left.gapCount - right.gapCount;
+    if (gapCountDiff !== 0) return gapCountDiff;
+    return left.startIndex - right.startIndex;
+  }
+
+  function rankThreadsForTaskQuery(threads, query) {
+    const searchTokens = getTaskSearchTokens(query);
+    if (searchTokens.length === 0) return Array.isArray(threads) ? threads.slice().sort(compareThreadsByUpdatedAtDesc) : [];
+
+    return (Array.isArray(threads) ? threads : [])
+      .map((thread) => buildTaskSearchCandidate(thread))
+      .map((candidate) => {
+        const fields = [
+          candidate.normalizedTitle,
+          candidate.normalizedRepoLabel,
+          candidate.normalizedCwd,
+          candidate.normalizedPreview,
+          candidate.normalizedSearchText
+        ];
+        let bestMatch = null;
+        for (let index = 0; index < fields.length; index += 1) {
+          const match = getFieldMatch(fields[index], searchTokens, index);
+          if (!match) continue;
+          if (!bestMatch || compareTaskSearchMatch(match, bestMatch) < 0) bestMatch = match;
+        }
+        return { candidate, match: bestMatch };
+      })
+      .filter((entry) => entry.match)
+      .sort((left, right) => {
+        const matchDiff = compareTaskSearchMatch(left.match, right.match);
+        if (matchDiff !== 0) return matchDiff;
+        return right.candidate.updatedAt - left.candidate.updatedAt;
+      })
+      .map((entry) => entry.candidate.thread);
+  }
+
+  function taskSectionKey(updatedAt) {
+    if (!updatedAt) return "undated";
+    const date = new Date(updatedAt);
+    const today = new Date();
+    const startOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
+    const startOfTarget = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+    const dayDiff = Math.round((startOfToday - startOfTarget) / 86400000);
+    if (dayDiff <= 0) return "today";
+    if (dayDiff === 1) return "yesterday";
+    return "earlier";
+  }
+
+  function taskSectionLabel(sectionKey) {
+    switch (sectionKey) {
+      case "today":
+        return t("taskSectionToday");
+      case "yesterday":
+        return t("taskSectionYesterday");
+      case "earlier":
+        return t("taskSectionEarlier");
+      default:
+        return t("taskSectionUndated");
+    }
   }
 
   function renderTaskPicker() {
     if (!taskList || !state) return;
     taskList.textContent = "";
 
-    const q = String(taskQuery || "").toLowerCase().trim();
-    const threads = Array.isArray(state.threads) ? state.threads : [];
-
-    const filtered = q
-      ? threads.filter((thread) => {
-          const title = taskDisplayTitle(thread).toLowerCase();
-          return title.includes(q) || getThreadId(thread).toLowerCase().includes(q);
-        })
-      : threads;
-
-    for (const thread of filtered) {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "task-item";
-      if (state.threadId && getThreadId(thread) === state.threadId) btn.classList.add("is-active");
-
-      const left = document.createElement("div");
-      left.style.minWidth = "0";
-
-      const title = document.createElement("div");
-      title.className = "task-item-title";
-      title.textContent = taskDisplayTitle(thread);
-
-      const sub = document.createElement("div");
-      sub.className = "task-item-sub";
-      sub.textContent = getThreadCwd(thread);
-
-      left.appendChild(title);
-      left.appendChild(sub);
-
-      const time = document.createElement("div");
-      time.className = "task-item-time";
-      const updatedAt = getThreadUpdatedAt(thread);
-      time.textContent = updatedAt ? relTime(updatedAt) : "";
-
-      btn.appendChild(left);
-      btn.appendChild(time);
-
-      btn.addEventListener("click", () => {
-        const threadId = getThreadId(thread);
-        if (!threadId) return;
-        vscode.postMessage({ type: "resumeThread", threadId });
-        setTaskPickerOpen(false);
-      });
-
-      taskList.appendChild(btn);
+    const q = String(taskQuery || "").trim();
+    const tasks = getTasks()
+      .filter((thread) => showArchivedTasks || !Boolean(thread && thread.archived))
+      .slice()
+      .sort(compareThreadsByUpdatedAtDesc);
+    const filtered = rankThreadsForTaskQuery(tasks, q);
+    if (homeStats) {
+      const allTasks = getTasks();
+      const archivedCount = allTasks.filter((thread) => Boolean(thread && thread.archived)).length;
+      const activeCount = Math.max(0, allTasks.length - archivedCount);
+      homeStats.textContent = `${activeCount} active · ${archivedCount} archived`;
     }
+    const isSearchMode = q.length > 0;
+
+    function renderTaskRow(thread) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "task-item";
+        if (state.threadId && getThreadId(thread) === state.threadId) btn.classList.add("is-active");
+        btn.title = taskDisplayTitle(thread);
+
+        const left = document.createElement("div");
+        left.className = "task-item-main";
+
+        const title = document.createElement("div");
+        title.className = "task-item-title";
+        title.textContent = taskDisplayTitle(thread);
+
+        const sub = document.createElement("div");
+        sub.className = "task-item-sub";
+        const repoLabel = getThreadRepoLabel(thread);
+        const cwd = getThreadCwd(thread);
+        sub.textContent = repoLabel && cwd && repoLabel !== cwd ? `${repoLabel} · ${cwd}` : repoLabel || cwd;
+        if (cwd) sub.title = cwd;
+
+        left.appendChild(title);
+        left.appendChild(sub);
+
+        const time = document.createElement("div");
+        time.className = "task-item-time";
+        const updatedAt = getThreadUpdatedAt(thread);
+        time.textContent = updatedAt ? relTime(updatedAt) : "";
+
+        const right = document.createElement("div");
+        right.className = "task-item-side";
+        if (state.threadId && getThreadId(thread) === state.threadId) {
+          const marker = document.createElement("div");
+          marker.className = "task-item-active";
+          marker.textContent = "OPEN";
+          right.appendChild(marker);
+        }
+        right.appendChild(time);
+
+        btn.appendChild(left);
+        btn.appendChild(right);
+
+        btn.addEventListener("click", () => {
+          const threadId = getThreadId(thread);
+          if (!threadId) return;
+          vscode.postMessage({ type: "resumeThread", threadId });
+          setCurrentPage("chat", { skipFocus: true });
+        });
+
+        taskList.appendChild(btn);
+    }
+
+    for (const thread of filtered) renderTaskRow(thread);
   }
 
   function renderAttachments() {
@@ -991,6 +1411,10 @@
     chat.scrollTop = chat.scrollHeight;
   }
 
+  function activeThreadId() {
+    return state && state.threadId ? String(state.threadId) : "";
+  }
+
   function scheduleMaybeClearBusy() {
     const token = ++clearBusyToken;
     setTimeout(() => {
@@ -1040,15 +1464,24 @@
 
     const cwd = state && state.cwd ? String(state.cwd) : "";
     const now = Date.now();
+    const currentTurn = getCurrentRenderableTurn();
 
-    let kind = "thinking";
-    let kindLabel = t("thinking");
+    let kind = currentTurn && currentTurn.progressIndicator ? String(currentTurn.progressIndicator) : "thinking";
+    let kindLabel =
+      kind === "exploring" ? t("exploring") : kind === "planning" ? t("planning") : t("thinking");
     let detailText = "";
 
-    if (activeFileChange) {
+    if (kind === "none") {
+      activityIndicator.hidden = true;
+      activityIndicator.classList.remove("is-active");
+      lastActivityKey = "";
+      return;
+    }
+
+    if (activeFileChange && kind !== "exploring" && kind !== "planning") {
       kind = "file";
       kindLabel = t("editingFiles");
-    } else if (activeCommand) {
+    } else if (activeCommand && kind !== "exploring" && kind !== "planning") {
       kind = "command";
       kindLabel = t("runningCommand");
     } else if (stickyActivity && typeof stickyActivity.untilMs === "number" && stickyActivity.untilMs > now) {
@@ -1084,10 +1517,27 @@
     return row;
   }
 
+  function findPendingAssistantAnchor() {
+    const pendingBubble = chat.querySelector(".row-assistant .bubble.pending");
+    return pendingBubble && pendingBubble.closest ? pendingBubble.closest(".row") : null;
+  }
+
+  function insertRowFromTemplateBeforePendingAssistant(tpl) {
+    const anchor = findPendingAssistantAnchor();
+    if (!anchor) return addRowFromTemplate(tpl);
+    const frag = tpl.content.cloneNode(true);
+    const row = frag.firstElementChild;
+    chat.insertBefore(frag, anchor);
+    scrollToBottom();
+    return row;
+  }
+
   function addUserMessage(text) {
     const row = addRowFromTemplate(tplUser);
+    const options = arguments.length >= 3 && arguments[2] && typeof arguments[2] === "object" ? arguments[2] : null;
     const bubble = row.querySelector(".bubble");
     bubble.textContent = "";
+    if (options && options.optimistic && row && row.dataset) row.dataset.optimistic = "true";
 
     const msgText = String(text || "");
     if (msgText.trim()) {
@@ -1173,6 +1623,8 @@
       }
       bubble.appendChild(wrap);
     }
+
+    return row;
   }
 
   function normalizeAttachmentRef(att) {
@@ -1185,6 +1637,53 @@
   function normalizeAttachmentRefs(list) {
     if (!Array.isArray(list)) return [];
     return list.map((att) => normalizeAttachmentRef(att)).filter(Boolean);
+  }
+
+  function getOptimisticUserMessages(threadId) {
+    const activeThreadId = String(threadId || "");
+    if (!activeThreadId) return [];
+    const entries = optimisticUserMessagesByThreadId[activeThreadId];
+    return Array.isArray(entries) ? entries : [];
+  }
+
+  function setOptimisticUserMessages(threadId, entries) {
+    const activeThreadId = String(threadId || "");
+    if (!activeThreadId) return;
+    if (!Array.isArray(entries) || entries.length === 0) {
+      delete optimisticUserMessagesByThreadId[activeThreadId];
+      return;
+    }
+    optimisticUserMessagesByThreadId[activeThreadId] = entries;
+  }
+
+  function getOptimisticUserRows(threadId) {
+    const activeThreadId = String(threadId || "");
+    if (!activeThreadId) return [];
+    const entries = optimisticUserRowsByThreadId[activeThreadId];
+    return Array.isArray(entries) ? entries : [];
+  }
+
+  function setOptimisticUserRows(threadId, entries) {
+    const activeThreadId = String(threadId || "");
+    if (!activeThreadId) return;
+    if (!Array.isArray(entries) || entries.length === 0) {
+      delete optimisticUserRowsByThreadId[activeThreadId];
+      return;
+    }
+    optimisticUserRowsByThreadId[activeThreadId] = entries;
+  }
+
+  function addOptimisticUserMessage(threadId, text, attachments) {
+    const activeThreadId = String(threadId || "");
+    if (!activeThreadId) return;
+    const nextEntries = getOptimisticUserMessages(activeThreadId).concat([
+      {
+        threadId: activeThreadId,
+        text: String(text || ""),
+        attachments: Array.isArray(attachments) ? attachments.slice() : []
+      }
+    ]);
+    setOptimisticUserMessages(activeThreadId, nextEntries);
   }
 
   function sameOptimisticUserMessage(left, right) {
@@ -1201,7 +1700,8 @@
 
   function reconcileOptimisticUserMessages(threadId, items) {
     const activeThreadId = String(threadId || "");
-    if (!activeThreadId || optimisticUserMessages.length === 0) return;
+    const optimisticEntries = getOptimisticUserMessages(activeThreadId);
+    if (!activeThreadId) return;
 
     const seenUserMessages = [];
     for (const item of Array.isArray(items) ? items : []) {
@@ -1210,21 +1710,43 @@
       seenUserMessages.push({ text: parsed.text, attachments: parsed.attachments });
     }
 
-    optimisticUserMessages = optimisticUserMessages.filter((entry) => {
-      if (String(entry.threadId || "") !== activeThreadId) return true;
+    const remainingEntries = optimisticEntries.filter((entry) => {
       const matchIndex = seenUserMessages.findIndex((candidate) => sameOptimisticUserMessage(entry, candidate));
       if (matchIndex < 0) return true;
       seenUserMessages.splice(matchIndex, 1);
       return false;
     });
+    setOptimisticUserMessages(activeThreadId, remainingEntries);
+
+    const optimisticRows = getOptimisticUserRows(activeThreadId);
+    if (optimisticRows.length === 0) return;
+
+    const unmatchedCanonical = [];
+    for (const item of Array.isArray(items) ? items : []) {
+      if (!item || item.type !== "userMessage") continue;
+      const parsed = parseUserContent(item.content);
+      unmatchedCanonical.push({ text: parsed.text, attachments: parsed.attachments });
+    }
+
+    const remainingRows = optimisticRows.filter((entry) => {
+      const matchIndex = unmatchedCanonical.findIndex((candidate) => sameOptimisticUserMessage(entry, candidate));
+      if (matchIndex < 0) return true;
+      unmatchedCanonical.splice(matchIndex, 1);
+      if (entry.row && entry.row.remove) entry.row.remove();
+      return false;
+    });
+    setOptimisticUserRows(activeThreadId, remainingRows);
   }
 
   function renderOptimisticUserMessages(threadId) {
     const activeThreadId = String(threadId || "");
     if (!activeThreadId) return;
-    for (const entry of optimisticUserMessages) {
-      if (String(entry.threadId || "") !== activeThreadId) continue;
-      addUserMessage(entry.text, entry.attachments);
+    for (const entry of getOptimisticUserMessages(activeThreadId)) {
+      const row = addUserMessage(entry.text, entry.attachments, { optimistic: true });
+      const nextRows = getOptimisticUserRows(activeThreadId).concat([
+        { text: entry.text, attachments: entry.attachments, row }
+      ]);
+      setOptimisticUserRows(activeThreadId, nextRows);
     }
   }
 
@@ -1254,8 +1776,37 @@
   }
 
   function addSystemMessage(text) {
-    const row = addRowFromTemplate(tplSystem);
+    const row = insertRowFromTemplateBeforePendingAssistant(tplSystem);
     renderTextWithLinks(row.querySelector(".bubble"), text);
+  }
+
+  function showUiNotice(text, options) {
+    if (!noticeStack || !text) return;
+    const opts = options && typeof options === "object" ? options : {};
+    const notice = document.createElement("div");
+    notice.className = "notice";
+    const kind = String(opts.kind || "notice");
+    notice.dataset.kind = kind;
+    notice.dataset.noticeId = String(noticeSeq++);
+    const label = document.createElement("div");
+    label.className = "notice-text";
+    label.textContent = String(text);
+    notice.appendChild(label);
+    noticeStack.appendChild(notice);
+
+    requestAnimationFrame(() => {
+      notice.classList.add("is-visible");
+    });
+
+    const ttl = Number.isFinite(Number(opts.ttlMs)) ? Number(opts.ttlMs) : kind === "error" ? 5200 : 2600;
+    const close = () => {
+      notice.classList.remove("is-visible");
+      notice.classList.add("is-leaving");
+      setTimeout(() => {
+        if (notice.parentNode) notice.parentNode.removeChild(notice);
+      }, 180);
+    };
+    setTimeout(close, Math.max(800, ttl));
   }
 
   function clampPreview(s, maxLen) {
@@ -1267,7 +1818,7 @@
   function ensureSystemRow(itemId) {
     let row = systemByItemId.get(itemId);
     if (!row) {
-      row = addRowFromTemplate(tplSystem);
+      row = insertRowFromTemplateBeforePendingAssistant(tplSystem);
       row.querySelector(".bubble").textContent = "";
       systemByItemId.set(itemId, row);
     }
@@ -1281,7 +1832,7 @@
   function ensureOpenCommandGroup() {
     if (openCommandGroup) return openCommandGroup;
 
-    const row = addRowFromTemplate(tplSystem);
+    const row = insertRowFromTemplateBeforePendingAssistant(tplSystem);
     const bubble = row.querySelector(".bubble");
     bubble.textContent = "";
 
@@ -1589,10 +2140,14 @@
       historyRenderJob = null;
     }
     assistantByItemId.clear();
+    assistantHtmlByItemId.clear();
     systemByItemId.clear();
     systemKindByItemId.clear();
     commandUIByItemId.clear();
     openCommandGroup = null;
+    currentHistoryItems = [];
+    liveAssistantRow = null;
+    optimisticUserRowsByThreadId = {};
     chat.textContent = "";
   }
 
@@ -1607,7 +2162,7 @@
     btn.type = "button";
     btn.textContent = `${hiddenCount} older items`;
     btn.onclick = () => {
-      visibleHistoryCount += 120;
+      visibleHistoryCount = Math.min(Number.MAX_SAFE_INTEGER, visibleHistoryCount + 120);
       renderThread(state && state.thread ? state.thread : null);
     };
 
@@ -1627,7 +2182,13 @@
       const itemId = typeof item.id === "string" ? item.id : "";
       const row = itemId ? ensureAssistantRow(itemId) : addRowFromTemplate(tplAssistant);
       const bubble = row.querySelector(".bubble");
-      if (item.html && typeof item.html === "string") renderHtmlInto(bubble, item.html);
+      const renderedHtml =
+        item.html && typeof item.html === "string"
+          ? item.html
+          : itemId && assistantHtmlByItemId.has(itemId)
+            ? assistantHtmlByItemId.get(itemId)
+            : "";
+      if (renderedHtml && typeof renderedHtml === "string") renderHtmlInto(bubble, renderedHtml);
       else renderTextWithLinks(bubble, normalizeAssistantText(item.text || ""));
       return;
     }
@@ -1691,6 +2252,292 @@
     }
     closeCommandGroup();
     addSystemMessage("item: " + item.type);
+  }
+
+  function countRenderableAgentMessages(entries) {
+    let count = 0;
+    for (const entry of Array.isArray(entries) ? entries : []) {
+      if (!entry || typeof entry !== "object") continue;
+      if (entry.kind === "exploration") {
+        count += Array.isArray(entry.items) ? entry.items.length : 0;
+        continue;
+      }
+      if (entry.kind === "item" && entry.item) count += 1;
+    }
+    return count;
+  }
+
+  function renderTurnGroup(group) {
+    if (!group || typeof group !== "object") return;
+    const sections = [group.preUserItems, group.userItems];
+    for (const section of sections) {
+      if (!Array.isArray(section)) continue;
+      for (const item of section) {
+        renderThreadItem(item);
+      }
+    }
+
+    const agentBodyState = renderAgentBodySection(group);
+
+    if (group.assistantItem && agentBodyState && agentBodyState.showDivider) {
+      const dividerRow = addFinalMessageDivider(Boolean(agentBodyState.isCollapsed));
+      if (agentBodyState.detailsEl && dividerRow) {
+        agentBodyState.detailsEl.addEventListener("toggle", () => {
+          dividerRow.hidden = !agentBodyState.detailsEl.open;
+        });
+      }
+    }
+
+    if (group.assistantItem) {
+      renderThreadItem(group.assistantItem);
+    }
+
+    if (Array.isArray(group.postAssistantItems)) {
+      for (const item of group.postAssistantItems) {
+        renderThreadItem(item);
+      }
+    }
+  }
+
+  function getCurrentRenderableTurn() {
+    const thread = state && state.thread ? state.thread : null;
+    if (!thread) return null;
+    const renderableTurns = getRenderableTurns(thread);
+    if (!Array.isArray(renderableTurns) || renderableTurns.length === 0) return null;
+    for (let index = renderableTurns.length - 1; index >= 0; index -= 1) {
+      const turn = renderableTurns[index];
+      if (turn && String(turn.status || "") === "in_progress") return turn;
+    }
+    return renderableTurns[renderableTurns.length - 1] || null;
+  }
+
+  function createInlineItemContainer(target) {
+    const row = document.createElement("div");
+    row.className = "inline-item";
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+    row.appendChild(bubble);
+    target.appendChild(row);
+    return { row, bubble };
+  }
+
+  function renderAgentItemInto(target, item) {
+    if (!target || !item || typeof item !== "object") return;
+    if (item.type === "agentMessage") {
+      const { bubble } = createInlineItemContainer(target);
+      bubble.classList.add("assistant");
+      const itemId = typeof item.id === "string" ? item.id : "";
+      const renderedHtml =
+        item.html && typeof item.html === "string"
+          ? item.html
+          : itemId && assistantHtmlByItemId.has(itemId)
+            ? assistantHtmlByItemId.get(itemId)
+            : "";
+      if (renderedHtml && typeof renderedHtml === "string") renderHtmlInto(bubble, renderedHtml);
+      else renderTextWithLinks(bubble, normalizeAssistantText(item.text || ""));
+      return;
+    }
+    if (item.type === "commandExecution") {
+      const wrap = document.createElement("div");
+      wrap.className = "inline-tool-card";
+      const details = document.createElement("details");
+      details.className = "fold plain cmd-item";
+      const summary = document.createElement("summary");
+      summary.className = "fold-summary fold-summary-compact";
+      const left = document.createElement("div");
+      left.className = "fold-left";
+      const title = document.createElement("div");
+      title.className = "fold-title";
+      title.textContent = "コマンドを実行";
+      const preview = document.createElement("div");
+      preview.className = "fold-sub";
+      preview.textContent = clampPreview(item.command || "", 80);
+      left.appendChild(title);
+      left.appendChild(preview);
+      const right = document.createElement("div");
+      right.className = "fold-right";
+      const badge = document.createElement("div");
+      badge.className = "badge";
+      badge.textContent = String(item.status || "");
+      right.appendChild(badge);
+      summary.appendChild(left);
+      summary.appendChild(right);
+      const pre = document.createElement("pre");
+      pre.className = "codeblock";
+      const out = item.aggregatedOutput || "";
+      renderTextWithLinks(pre, out ? `$ ${String(item.command || "").trim()}\n\n${out}` : `$ ${String(item.command || "").trim()}`);
+      details.appendChild(summary);
+      details.appendChild(pre);
+      wrap.appendChild(details);
+      target.appendChild(wrap);
+      return;
+    }
+    if (item.type === "fileChange") {
+      const wrap = document.createElement("div");
+      wrap.className = "inline-tool-card";
+      const details = document.createElement("details");
+      details.className = "fold plain fold-file";
+      const summary = document.createElement("summary");
+      summary.className = "fold-summary";
+      const left = document.createElement("div");
+      left.className = "fold-left";
+      const title = document.createElement("div");
+      title.className = "fold-title";
+      title.textContent = "編集済みファイル";
+      const sub = document.createElement("div");
+      sub.className = "fold-sub";
+      const changes = Array.isArray(item.changes) ? item.changes : [];
+      sub.textContent = `${changes.length} files`;
+      left.appendChild(title);
+      left.appendChild(sub);
+      const right = document.createElement("div");
+      right.className = "fold-right";
+      const badge = document.createElement("div");
+      badge.className = "badge";
+      badge.textContent = String(changes.length);
+      right.appendChild(badge);
+      summary.appendChild(left);
+      summary.appendChild(right);
+      const body = document.createElement("div");
+      body.className = "fold-body";
+      renderFileChangesInto(
+        body,
+        changes.map((c) => ({
+          kind: String(c && c.kind ? c.kind : ""),
+          path: String(c && c.path ? c.path : ""),
+          diff: String(c && c.diff ? c.diff : "")
+        }))
+      );
+      details.appendChild(summary);
+      details.appendChild(body);
+      wrap.appendChild(details);
+      target.appendChild(wrap);
+      return;
+    }
+    if (item.type === "reasoning") {
+      return;
+    }
+    if (item.type === "plan") {
+      const { bubble } = createInlineItemContainer(target);
+      bubble.classList.add("system");
+      renderTextWithLinks(bubble, "plan:\n" + (item.text || ""));
+      return;
+    }
+    if (item.type === "webSearch") {
+      const { bubble } = createInlineItemContainer(target);
+      bubble.classList.add("system");
+      renderTextWithLinks(bubble, "web search:\n" + (item.query || ""));
+      return;
+    }
+    const { bubble } = createInlineItemContainer(target);
+    bubble.classList.add("system");
+    renderTextWithLinks(bubble, "item: " + item.type);
+  }
+
+  function renderExplorationEntryInto(target, entry) {
+    const wrap = document.createElement("div");
+    wrap.className = "inline-tool-card exploration-card";
+    const details = document.createElement("details");
+    details.className = "fold plain exploration-fold";
+    details.open = false;
+
+    const summary = document.createElement("summary");
+    summary.className = "fold-summary fold-summary-compact";
+
+    const left = document.createElement("div");
+    left.className = "fold-left";
+    const title = document.createElement("div");
+    title.className = "fold-title";
+    title.textContent = entry.status === "exploring" ? t("thinking") : `${entry.items.length} ${t("exploredSteps")}`;
+    left.appendChild(title);
+
+    const right = document.createElement("div");
+    right.className = "fold-right";
+    const badge = document.createElement("div");
+    badge.className = "badge";
+    badge.textContent = String(Array.isArray(entry.items) ? entry.items.length : 0);
+    right.appendChild(badge);
+
+    summary.appendChild(left);
+    summary.appendChild(right);
+
+    const body = document.createElement("div");
+    body.className = "fold-body agent-body-content";
+    for (const item of Array.isArray(entry.items) ? entry.items : []) {
+      renderAgentItemInto(body, item);
+    }
+
+    details.appendChild(summary);
+    details.appendChild(body);
+    wrap.appendChild(details);
+    target.appendChild(wrap);
+  }
+
+  function addAgentBodyFold(entries, collapsed, workedForTimeLabel) {
+    const row = insertRowFromTemplateBeforePendingAssistant(tplSystem);
+    row.classList.add("row-agent-body");
+    const bubble = row.querySelector(".bubble");
+    bubble.textContent = "";
+    bubble.classList.add("agent-body-bubble");
+
+    const details = document.createElement("details");
+    details.className = "fold plain fold-agent-body";
+    details.open = !collapsed;
+
+    const summary = document.createElement("summary");
+    summary.className = "fold-summary fold-summary-compact";
+
+    const left = document.createElement("div");
+    left.className = "fold-left";
+    const title = document.createElement("div");
+    title.className = "fold-title";
+    title.textContent = workedForTimeLabel || `${countRenderableAgentMessages(entries)} ${t("pastMessages")}`;
+    left.appendChild(title);
+    summary.appendChild(left);
+
+    const body = document.createElement("div");
+    body.className = "fold-body agent-body-content";
+
+    for (const entry of Array.isArray(entries) ? entries : []) {
+      if (!entry || typeof entry !== "object") continue;
+      if (entry.kind === "exploration") {
+        renderExplorationEntryInto(body, entry);
+        continue;
+      }
+      if (entry.kind === "item" && entry.item) renderAgentItemInto(body, entry.item);
+    }
+
+    details.appendChild(summary);
+    details.appendChild(body);
+    bubble.appendChild(details);
+    return { row, details };
+  }
+
+  function addFinalMessageDivider(hidden) {
+    const row = addRowFromTemplate(tplSystem);
+    row.classList.add("row-final-divider");
+    row.hidden = Boolean(hidden);
+    const bubble = row.querySelector(".bubble");
+    bubble.textContent = "";
+    bubble.classList.add("final-divider-bubble");
+    const label = document.createElement("div");
+    label.className = "final-divider-label";
+    label.textContent = t("finalMessage");
+    bubble.appendChild(label);
+  }
+
+  function renderAgentBodySection(group) {
+    const agentEntries = Array.isArray(group && group.renderableAgentEntries) ? group.renderableAgentEntries : [];
+    if (agentEntries.length === 0) return null;
+    const status = String(group && group.status ? group.status : "");
+    const shouldAllowCollapse = status !== "in_progress" && status !== "cancelled";
+    const isCollapsed = shouldAllowCollapse;
+    const fold = addAgentBodyFold(agentEntries, isCollapsed, group && group.workedForTimeLabel ? String(group.workedForTimeLabel) : "");
+    return {
+      detailsEl: fold && fold.details ? fold.details : null,
+      isCollapsed,
+      showDivider: Boolean(group.assistantItem && shouldAllowCollapse)
+    };
   }
 
   function toUserText(content) {
@@ -1768,22 +2615,75 @@
     if (!thread) return;
     clearChat();
 
+    const renderableTurns = getRenderableTurns(thread);
     currentHistoryItems = flattenHistoryItems(thread);
     reconcileOptimisticUserMessages(thread && thread.id ? thread.id : state && state.threadId ? state.threadId : "", currentHistoryItems);
     const historyWindow = createThreadHistoryWindow(currentHistoryItems, visibleHistoryCount);
     if (historyWindow.hiddenCount > 0) addHistoryLoadMoreRow(historyWindow.hiddenCount);
     const shouldStickBottom = Math.abs(chat.scrollHeight - chat.scrollTop - chat.clientHeight) < 24;
-    historyRenderJob = renderQueue.createRenderQueue(historyWindow.items, (item) => {
-      renderThreadItem(item);
+    historyRenderJob = renderQueue.createRenderQueue(renderableTurns, (turn) => {
+      renderTurnGroup(turn);
     }, {
-      chunkSize: 20,
+      chunkSize: 8,
       onDone() {
         historyRenderJob = null;
         renderOptimisticUserMessages(thread && thread.id ? thread.id : state && state.threadId ? state.threadId : "");
+        if (liveAssistantPreview && serverBusy) renderLiveAssistantPreview();
         if (shouldStickBottom) scrollToBottom();
       }
     });
     historyRenderJob.start();
+  }
+
+  function historyItemStableKey(item, index) {
+    if (!item || typeof item !== "object") return `unknown:${index}`;
+    const type = String(item.type || "");
+    const id = typeof item.id === "string" && item.id ? item.id : "";
+    if (id) return `${type}:${id}`;
+    if (type === "userMessage") {
+      const parsed = parseUserContent(item.content);
+      return `${type}:${index}:${parsed.text}:${normalizeAttachmentRefs(parsed.attachments).join("|")}`;
+    }
+    return `${type}:${index}`;
+  }
+
+  function canIncrementallySyncHistory(nextItems) {
+    if (visibleHistoryCount !== DEFAULT_VISIBLE_HISTORY_COUNT) return false;
+    const prevItems = Array.isArray(currentHistoryItems) ? currentHistoryItems : [];
+    const nextList = Array.isArray(nextItems) ? nextItems : [];
+    if (prevItems.length === 0 || nextList.length < prevItems.length) return false;
+    for (let i = 0; i < prevItems.length; i += 1) {
+      if (historyItemStableKey(prevItems[i], i) !== historyItemStableKey(nextList[i], i)) return false;
+    }
+    return true;
+  }
+
+  function syncThreadIncrementally(thread, nextItems) {
+    const nextList = Array.isArray(nextItems) ? nextItems : [];
+    const activeThreadId = thread && thread.id ? thread.id : state && state.threadId ? state.threadId : "";
+    reconcileOptimisticUserMessages(activeThreadId, nextList);
+
+    const prevLength = Array.isArray(currentHistoryItems) ? currentHistoryItems.length : 0;
+    const sharedLength = Math.min(prevLength, nextList.length);
+
+    for (let i = 0; i < sharedLength; i += 1) {
+      const item = nextList[i];
+      if (!item || typeof item !== "object") continue;
+      if (item.type === "agentMessage" || item.type === "commandExecution" || item.type === "fileChange") {
+        renderThreadItem(item);
+      }
+    }
+
+    for (let i = prevLength; i < nextList.length; i += 1) {
+      const item = nextList[i];
+      if (!item || typeof item !== "object") continue;
+      if (item.type === "userMessage") continue;
+      renderThreadItem(item);
+    }
+
+    currentHistoryItems = nextList;
+    if (liveAssistantPreview && serverBusy) renderLiveAssistantPreview();
+    scrollToBottom();
   }
 
   function ensureAssistantRow(itemId) {
@@ -1796,8 +2696,41 @@
     return row;
   }
 
+  function clearLiveAssistantRow() {
+    if (liveAssistantRow) {
+      const bubble = liveAssistantRow.querySelector ? liveAssistantRow.querySelector(".bubble") : null;
+      if (bubble && bubble.classList) bubble.classList.remove("pending");
+    }
+    liveAssistantRow = null;
+  }
+
+  function renderLiveAssistantPreview() {
+    if (!liveAssistantPreview || !chat) return;
+    const itemId = String(liveAssistantPreview.itemId || "");
+    const sameItem =
+      liveAssistantRow &&
+      liveAssistantRow.dataset &&
+      liveAssistantRow.dataset.itemId === itemId;
+    const row = sameItem ? liveAssistantRow : ensureAssistantRow(itemId);
+    if (row && row.dataset) row.dataset.itemId = itemId;
+    const bubble = row.querySelector(".bubble");
+    if (liveAssistantPreview.pending) bubble.classList.add("pending");
+    else bubble.classList.remove("pending");
+    if (liveAssistantPreview.html) renderHtmlInto(bubble, liveAssistantPreview.html);
+    else renderTextWithLinks(bubble, normalizeAssistantText(liveAssistantPreview.text || ""));
+    liveAssistantRow = row;
+  }
+
+  function isMessageForActiveThread(threadId) {
+    const activeThreadId = state && state.threadId ? String(state.threadId) : "";
+    const incomingThreadId = String(threadId || "");
+    if (!incomingThreadId) return true;
+    if (!activeThreadId) return false;
+    return activeThreadId === incomingThreadId;
+  }
+
   function addApprovalRequest(requestId, method, params) {
-    const row = addRowFromTemplate(tplSystem);
+    const row = insertRowFromTemplateBeforePendingAssistant(tplSystem);
     const bubble = row.querySelector(".bubble");
     bubble.classList.add("approval");
 
@@ -1846,7 +2779,7 @@
   }
 
   function addUserInputRequest(requestId, params) {
-    const row = addRowFromTemplate(tplSystem);
+    const row = insertRowFromTemplateBeforePendingAssistant(tplSystem);
     const bubble = row.querySelector(".bubble");
     bubble.classList.add("approval");
 
@@ -1901,17 +2834,77 @@
     if (pendingSend) return;
     pendingSend = true;
     allowBusyUI = true;
+    const startNewThread = currentPage === "home";
+    if (startNewThread) {
+      if (state && typeof state === "object") {
+        state = Object.assign({}, state, { threadId: null, thread: null, busy: false, turnId: null });
+      }
+      lastRendered = { threadId: null, updatedAt: null, historySignature: null };
+      clearChat();
+    }
+    if (currentPage === "home") setCurrentPage("chat", { skipFocus: true });
     const threadId = state && state.threadId ? String(state.threadId) : "";
     input.value = "";
     autoResizeInput();
-    vscode.postMessage({ type: "send", text, attachments });
+    vscode.postMessage({ type: "send", text, attachments, startNewThread });
     attachments = [];
     renderAttachments();
-    if (threadId) clearDraftForThread(threadId);
+    if (threadId && !startNewThread) clearDraftForThread(threadId);
+  }
+
+  function getQueuedFollowUps(threadId) {
+    const activeThreadId = String(threadId || "");
+    if (!activeThreadId) return [];
+    const entries = queuedFollowUpsByThreadId[activeThreadId];
+    return Array.isArray(entries) ? entries : [];
+  }
+
+  function setQueuedFollowUps(threadId, entries) {
+    const activeThreadId = String(threadId || "");
+    if (!activeThreadId) return;
+    if (!Array.isArray(entries) || entries.length === 0) {
+      delete queuedFollowUpsByThreadId[activeThreadId];
+      return;
+    }
+    queuedFollowUpsByThreadId[activeThreadId] = entries;
+  }
+
+  function enqueueFollowUp() {
+    const text = input.value.trim();
+    const files = Array.isArray(attachments) ? attachments.slice() : [];
+    if (!text && files.length === 0) return false;
+    const threadId = state && state.threadId ? String(state.threadId) : "";
+    if (!threadId) return false;
+    const nextQueue = getQueuedFollowUps(threadId).concat([{ text, attachments: files }]);
+    setQueuedFollowUps(threadId, nextQueue);
+    input.value = "";
+    autoResizeInput();
+    attachments = [];
+    renderAttachments();
+    clearDraftForThread(threadId);
+    showUiNotice(`follow-up queued (${nextQueue.length})`, { kind: "notice", ttlMs: 2200 });
+    return true;
+  }
+
+  function flushQueuedFollowUp(threadId) {
+    const activeThreadId = String(threadId || "");
+    const queue = getQueuedFollowUps(activeThreadId);
+    if (!activeThreadId || queue.length === 0 || isBusy || pendingSend) return false;
+    const [nextEntry, ...rest] = queue;
+    setQueuedFollowUps(activeThreadId, rest);
+    pendingSend = true;
+    allowBusyUI = true;
+    vscode.postMessage({
+      type: "send",
+      text: String(nextEntry && nextEntry.text ? nextEntry.text : ""),
+      attachments: Array.isArray(nextEntry && nextEntry.attachments) ? nextEntry.attachments : []
+    });
+    return true;
   }
 
   function handleSendOrStop() {
     if (isBusy) {
+      if (enqueueFollowUp()) return;
       vscode.postMessage({ type: "interruptTurn" });
       return;
     }
@@ -2064,7 +3057,7 @@
     if (input) input.placeholder = t("typeMessage");
     if (baseInstructionsInput) baseInstructionsInput.placeholder = t("baseInstructionsPlaceholder");
     if (developerInstructionsInput) developerInstructionsInput.placeholder = t("sessionInstructionsPlaceholder");
-    setButtonLabel(taskPickerButton, t("task"), t("taskPickerButton"));
+    setButtonLabel(homeButton, t("task"), t("taskPickerButton"));
     setButtonLabel(openSettings, t("settings"));
     setButtonLabel(taskClose, t("close"));
     setButtonLabel(taskNew, t("newThread"));
@@ -2111,14 +3104,89 @@
     renderAgentsInstructionsState(state);
   }
 
+  function applyLockedPersonaUiState() {
+    if (!personaSettingsLocked) return;
+    const textareas = [baseInstructionsInput, developerInstructionsInput];
+    for (const el of textareas) {
+      if (!el) continue;
+      el.readOnly = true;
+      el.setAttribute("aria-readonly", "true");
+      el.title = t("personaLockedHelp");
+    }
+
+    const disabledButtons = [
+      saveBaseInstructionsBtn,
+      clearBaseInstructionsBtn,
+      saveDeveloperInstructionsBtn,
+      clearDeveloperInstructionsBtn,
+      saveInstructionModesBtn,
+      clearInstructionModesBtn
+    ];
+    for (const el of disabledButtons) {
+      if (!el) continue;
+      el.disabled = true;
+      el.title = t("personaLockedHelp");
+      el.setAttribute("aria-label", t("personaLockedHelp"));
+    }
+
+    const disabledSelects = [collaborationModeSelect, personalitySelect];
+    for (const el of disabledSelects) {
+      if (!el) continue;
+      el.disabled = true;
+      el.title = t("personaLockedHelp");
+      el.setAttribute("aria-label", t("personaLockedHelp"));
+    }
+
+    if (baseInstructionsHelp) baseInstructionsHelp.textContent = t("personaLockedHelp");
+    if (sessionInstructionsHelp) sessionInstructionsHelp.textContent = t("personaLockedHelp");
+    if (modeInstructionsHelp) modeInstructionsHelp.textContent = t("personaLockedHelp");
+  }
+
+  function getTaskSummarySignature(snapshot) {
+    const tasks = Array.isArray(snapshot && snapshot.tasks)
+      ? snapshot.tasks
+      : Array.isArray(snapshot && snapshot.threads)
+        ? snapshot.threads
+        : [];
+    if (!tasks.length) return `none:${String(snapshot && snapshot.threadId ? snapshot.threadId : "")}`;
+    return tasks
+      .map((thread, index) => {
+        const id = getThreadId(thread) || `#${index}`;
+        const updated = getThreadUpdatedAt(thread) || "";
+        const archived = thread && thread.archived ? "1" : "0";
+        return `${id}:${updated}:${archived}`;
+      })
+      .join("|");
+  }
+
+  function mergeIncomingState(prevState, nextState) {
+    const incoming = nextState && typeof nextState === "object" ? Object.assign({}, nextState) : {};
+    const previous = prevState && typeof prevState === "object" ? prevState : null;
+    if (!previous) return incoming;
+
+    const previousThreadId = previous && previous.threadId ? String(previous.threadId) : "";
+    const incomingThreadId = incoming && incoming.threadId ? String(incoming.threadId) : "";
+    const sameThread = previousThreadId && incomingThreadId && previousThreadId === incomingThreadId;
+    const incomingThread =
+      Object.prototype.hasOwnProperty.call(incoming, "thread") && incoming.thread !== undefined ? incoming.thread : undefined;
+
+    if (sameThread && (incomingThread === null || incomingThread === undefined) && previous.thread) {
+      incoming.thread = previous.thread;
+    }
+
+    return incoming;
+  }
+
   function applyState(s) {
-    const prevThreadId = state && state.threadId ? String(state.threadId) : null;
-    const effectiveSettings = mergeDisplayedAccessSettings(s && s.settings);
-    state = s;
+    const prevState = state;
+    const prevThreadId = prevState && prevState.threadId ? String(prevState.threadId) : null;
+    const mergedState = mergeIncomingState(prevState, s);
+    const effectiveSettings = mergeDisplayedAccessSettings(mergedState && mergedState.settings);
+    state = mergedState;
     if (state && typeof state === "object") state.settings = effectiveSettings;
     uiLocale = effectiveSettings && effectiveSettings.uiLocale ? String(effectiveSettings.uiLocale) : uiLocale;
-    const models = (s.models || []).filter((m) => !m.hidden);
-    const effectiveModelId = resolveEffectiveModelId(s, models);
+    const models = (state.models || []).filter((m) => !m.hidden);
+    const effectiveModelId = resolveEffectiveModelId(state, models);
     const effectiveModelLabel = resolveEffectiveModelLabel(models, effectiveModelId);
     setOptions(
       modelSelect,
@@ -2126,27 +3194,34 @@
       (effectiveSettings && effectiveSettings.model) || ""
     );
     applyLocale();
-    renderAgentsInstructionsState(s);
+    renderAgentsInstructionsState(state);
     syncBaseInstructionsEditor(effectiveSettings && effectiveSettings.baseInstructions);
     syncDeveloperInstructionsEditor(effectiveSettings && effectiveSettings.developerInstructions);
-    updateInstructionOptions(s);
+    updateInstructionOptions(state);
+    applyLockedPersonaUiState();
 
-    if (taskTitle) {
-      const threads = Array.isArray(s.threads) ? s.threads : [];
-      const current = threads.find((thread) => getThreadId(thread) === s.threadId) || threads[0] || null;
-      taskTitle.textContent = current ? taskDisplayTitle(current) : t("taskFallback");
-    }
-    if (isTaskPickerOpen()) renderTaskPicker();
+    const nextTaskSummarySignature = getTaskSummarySignature(state);
+    const tasksChanged = nextTaskSummarySignature !== lastTaskSummarySignature;
+    if (taskTitle && (tasksChanged || state.threadId !== prevThreadId)) refreshHeaderCopy();
+    if (isTaskPickerOpen() && tasksChanged) renderTaskPicker();
+    lastTaskSummarySignature = nextTaskSummarySignature;
 
-    const nextThreadId = s && s.threadId ? String(s.threadId) : null;
+    const nextThreadId = state && state.threadId ? String(state.threadId) : null;
     if (nextThreadId && nextThreadId !== prevThreadId) {
-      visibleHistoryCount = 120;
-      if (prevThreadId) persistDraftNow(prevThreadId);
+      visibleHistoryCount = DEFAULT_VISIBLE_HISTORY_COUNT;
+      if (prevThreadId) {
+        persistDraftNow(prevThreadId);
+      }
       restoreDraftForThread(nextThreadId);
+      setCurrentPage("chat", { skipFocus: true });
     } else if (nextThreadId && !prevThreadId) {
-      visibleHistoryCount = 120;
+      visibleHistoryCount = DEFAULT_VISIBLE_HISTORY_COUNT;
       restoreDraftForThread(nextThreadId);
+      if (currentPage !== "home") setCurrentPage("chat", { skipFocus: true });
+    } else if (!nextThreadId) {
+      setCurrentPage("home", { skipFocus: true });
     }
+    if (chatEmpty) chatEmpty.hidden = Boolean(nextThreadId) || currentPage !== "chat";
 
     setOptions(
       approvalSelect,
@@ -2171,7 +3246,7 @@
 
     updateEffortOptions();
 
-    status.textContent = s.connectionStatus || "ready";
+    status.textContent = formatStatusText(state.connectionStatus || "ready", "");
 
     if (fullAccessLabel && toggleFullAccess) {
       const sandbox = (effectiveSettings && effectiveSettings.sandbox) || null;
@@ -2194,19 +3269,27 @@
       toggleApproval.setAttribute("aria-label", `approval: ${approval || "default"}`);
     }
 
-    renderRateFooter(s.rateLimits);
-    serverBusy = Boolean(s && s.busy);
+    renderRateFooter(state.rateLimits);
+    serverBusy = Boolean(state && state.busy);
     setBusy(serverBusy && allowBusyUI);
 
-    const threadData = s.thread || null;
-    const updatedAt = threadData && typeof threadData.updatedAt === "number" ? threadData.updatedAt : null;
-    const historySignature = threadData ? `${updatedAt === null ? "na" : updatedAt}:${getThreadHistorySignature(threadData)}` : null;
-    const renderedThreadId = s.threadId || null;
+    const threadData = state.thread || null;
+    const nextHistoryItems = threadData ? flattenHistoryItems(threadData) : [];
+    const historySignature = threadData ? getThreadHistorySignature(threadData) : null;
+    const renderedThreadId = state.threadId || null;
     const threadChanged = renderedThreadId !== lastRendered.threadId;
     const historyChanged = historySignature !== null && historySignature !== lastRendered.historySignature;
-    if (threadData && (threadChanged || historyChanged)) {
-      lastRendered = { threadId: renderedThreadId, updatedAt, historySignature };
-      renderThread(threadData);
+    const shouldRerenderThread = Boolean(
+      threadData &&
+        (threadChanged || (!serverBusy && historyChanged))
+    );
+    if (shouldRerenderThread) {
+      lastRendered = { threadId: renderedThreadId, updatedAt: null, historySignature };
+      if (!threadChanged && !serverBusy && canIncrementallySyncHistory(nextHistoryItems)) {
+        syncThreadIncrementally(threadData, nextHistoryItems);
+      } else {
+        renderThread(threadData);
+      }
     } else if (!renderedThreadId) {
       lastRendered = { threadId: null, updatedAt: null, historySignature: null };
       clearChat();
@@ -2395,7 +3478,11 @@
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      if (!isBusy) doSend();
+      if (isBusy) {
+        enqueueFollowUp();
+        return;
+      }
+      doSend();
     }
   });
   input.addEventListener("dragover", (e) => {
@@ -2437,8 +3524,7 @@
 
   if (openSettings) {
     openSettings.addEventListener("click", () => {
-      // Settings and Task picker should behave like a single popover at a time.
-      setTaskPickerOpen(false);
+      if (currentPage === "home" && state && state.threadId) setCurrentPage("chat", { skipFocus: true });
       setSettingsOpen(!isSettingsOpen());
     });
   }
@@ -2446,7 +3532,7 @@
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       setSettingsOpen(false);
-      setTaskPickerOpen(false);
+      if (state && state.threadId) setCurrentPage("chat", { skipFocus: true });
     }
   });
 
@@ -2455,10 +3541,16 @@
     const path = typeof e.composedPath === "function" ? e.composedPath() : [];
     if (openSettings && (path.includes(openSettings) || openSettings.contains(e.target))) return;
     if (settingsPop && (path.includes(settingsPop) || settingsPop.contains(e.target))) return;
-    if (taskPickerButton && (path.includes(taskPickerButton) || taskPickerButton.contains(e.target))) return;
+    if (homeButton && (path.includes(homeButton) || homeButton.contains(e.target))) return;
     if (taskPop && (path.includes(taskPop) || taskPop.contains(e.target))) return;
+    if (currentPage === "home") {
+      if (input && (path.includes(input) || input.contains(e.target))) return;
+      if (send && (path.includes(send) || send.contains(e.target))) return;
+      if (attachFiles && (path.includes(attachFiles) || attachFiles.contains(e.target))) return;
+      if (attachmentsEl && (path.includes(attachmentsEl) || attachmentsEl.contains(e.target))) return;
+    }
     setSettingsOpen(false);
-    setTaskPickerOpen(false);
+    setCurrentPage("chat", { skipFocus: true });
   });
 
   if (attachFiles) {
@@ -2599,17 +3691,17 @@
     vscode.postMessage({ type: "createAgentsInstructions" });
   });
 
-  if (taskPickerButton) taskPickerButton.addEventListener("click", (e) => {
+  if (homeButton) homeButton.addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
     setSettingsOpen(false);
-    setTaskPickerOpen(!isTaskPickerOpen());
+    setCurrentPage("home");
   });
 
   if (taskClose) taskClose.addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
-    setTaskPickerOpen(false);
+    setCurrentPage("chat", { skipFocus: true });
   });
 
   if (taskNew) taskNew.addEventListener("click", (e) => {
@@ -2623,17 +3715,24 @@
     autoResizeInput();
     attachments = [];
     renderAttachments();
-    setTaskPickerOpen(false);
+    setCurrentPage("chat", { skipFocus: true });
   });
 
   if (taskArchive) taskArchive.addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
+    if (currentPage === "home") {
+      showArchivedTasks = !showArchivedTasks;
+      taskArchive.classList.toggle("is-active", showArchivedTasks);
+      renderTaskPicker();
+      if (taskSubtitle) taskSubtitle.textContent = showArchivedTasks ? "Recent + archived tasks" : "Recent tasks";
+      return;
+    }
     if (!state || !state.threadId) return;
     const ok = confirm(t("taskArchiveConfirm"));
     if (!ok) return;
     vscode.postMessage({ type: "archiveThread", threadId: state.threadId });
-    setTaskPickerOpen(false);
+    setCurrentPage("home", { skipFocus: true });
   });
 
   if (taskSearch) taskSearch.addEventListener("input", () => {
@@ -2705,7 +3804,7 @@
     }
 
     if (msg.type === "status") {
-      status.textContent = msg.message ? `${msg.status}: ${msg.message}` : msg.status;
+      status.textContent = formatStatusText(msg.status, msg.message);
       return;
     }
 
@@ -2736,12 +3835,13 @@
 
     if (msg.type === "userMessage") {
       const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
-      optimisticUserMessages.push({
-        threadId: state && state.threadId ? String(state.threadId) : "",
-        text: String(msg.text || ""),
-        attachments
-      });
-      addUserMessage(msg.text, attachments);
+      const threadId = msg.threadId ? String(msg.threadId) : state && state.threadId ? String(state.threadId) : "";
+      addOptimisticUserMessage(threadId, msg.text, attachments);
+      const row = addUserMessage(msg.text, attachments, { optimistic: true });
+      if (threadId) {
+        const nextRows = getOptimisticUserRows(threadId).concat([{ text: msg.text, attachments, row }]);
+        setOptimisticUserRows(threadId, nextRows);
+      }
       return;
     }
 
@@ -2752,7 +3852,9 @@
     }
 
     if (msg.type === "systemMessage") {
-      addSystemMessage(msg.text);
+      const kind = msg.kind ? String(msg.kind) : "info";
+      if (msg.transient || kind === "notice") showUiNotice(msg.text, { kind });
+      else addSystemMessage(msg.text);
       return;
     }
 
@@ -2761,10 +3863,10 @@
       pendingSend = false;
       pendingAssistantItems++;
       if (!isBusy) setBusy(true);
-      closeCommandGroup();
-      const row = ensureAssistantRow(msg.itemId);
-      const bubble = row && row.querySelector ? row.querySelector(".bubble") : null;
-      if (bubble) bubble.classList.add("pending");
+      if (msg.itemId) {
+        liveAssistantPreview = { itemId: String(msg.itemId), text: "", html: "", pending: true };
+        renderLiveAssistantPreview();
+      }
       return;
     }
 
@@ -2772,119 +3874,107 @@
       allowBusyUI = true;
       pendingSend = false;
       if (!isBusy) setBusy(true);
-      closeCommandGroup();
-      const row = ensureAssistantRow(msg.itemId);
-      const bubble = row.querySelector(".bubble");
-      bubble.classList.add("pending");
-      bubble.textContent += msg.delta;
-      if (looksLikeEscapedDocument(bubble.textContent)) bubble.textContent = unescapeCommonSequences(bubble.textContent);
-      scrollToBottom();
+      if (msg.itemId) {
+        const itemId = String(msg.itemId);
+        const previousText =
+          liveAssistantPreview && liveAssistantPreview.itemId === itemId ? String(liveAssistantPreview.text || "") : "";
+        liveAssistantPreview = {
+          itemId,
+          text: previousText + String(msg.delta || ""),
+          html: "",
+          pending: true
+        };
+        renderLiveAssistantPreview();
+      }
       return;
     }
 
     if (msg.type === "assistantDone") {
-      closeCommandGroup();
-      const row = ensureAssistantRow(msg.itemId);
-      const bubble = row.querySelector(".bubble");
-      bubble.classList.remove("pending");
-      if (typeof msg.html === "string" && msg.html) renderHtmlInto(bubble, msg.html);
-      else renderTextWithLinks(bubble, normalizeAssistantText(msg.text));
-      scrollToBottom();
+      if (msg.itemId) {
+        const itemId = String(msg.itemId);
+        liveAssistantPreview = {
+          itemId,
+          text:
+            String(msg.text || "") ||
+            (liveAssistantPreview && liveAssistantPreview.itemId === itemId ? String(liveAssistantPreview.text || "") : ""),
+          html: "",
+          pending: false
+        };
+        renderLiveAssistantPreview();
+      }
       if (pendingAssistantItems > 0) pendingAssistantItems--;
       scheduleMaybeClearBusy();
       return;
     }
 
     if (msg.type === "assistantRendered") {
-      const row = ensureAssistantRow(msg.itemId);
-      const bubble = row.querySelector(".bubble");
-      renderHtmlInto(bubble, msg.html);
-      scrollToBottom();
+      if (msg.itemId) {
+        const itemId = String(msg.itemId);
+        assistantHtmlByItemId.set(itemId, String(msg.html || ""));
+        if (liveAssistantPreview && liveAssistantPreview.itemId === itemId) {
+          liveAssistantPreview = {
+            itemId,
+            text: String(liveAssistantPreview.text || ""),
+            html: String(msg.html || ""),
+            pending: false
+          };
+          renderLiveAssistantPreview();
+        }
+        const renderedRow = assistantByItemId.get(itemId);
+        if (renderedRow) {
+          const bubble = renderedRow.querySelector(".bubble");
+          if (bubble) renderHtmlInto(bubble, String(msg.html || ""));
+        }
+      }
       return;
     }
 
     if (msg.type === "systemDelta") {
-      closeCommandGroup();
-      const row = ensureSystemRow(msg.itemId);
-      row.querySelector(".bubble").textContent += msg.delta;
-      scrollToBottom();
       return;
     }
 
     if (msg.type === "systemDone") {
-      closeCommandGroup();
-      const row = ensureSystemRow(msg.itemId);
-      renderTextWithLinks(row.querySelector(".bubble"), msg.text);
-      scrollToBottom();
       scheduleMaybeClearBusy();
       return;
     }
 
     if (msg.type === "commandExecutionDelta") {
-      const ui = ensureCommandExecutionUI(msg.itemId);
-      if (ui.detailsEl) ui.detailsEl.classList.add("pending");
-      if (ui.outputEl) ui.outputEl.textContent += msg.delta;
-      scrollToBottom();
       return;
     }
 
     if (msg.type === "commandExecutionDone") {
-      const ui = ensureCommandExecutionUI(msg.itemId);
-      if (ui.detailsEl) ui.detailsEl.classList.remove("pending");
-      if (ui.previewEl) ui.previewEl.textContent = clampPreview(msg.command, 80);
-      if (ui.statusEl) ui.statusEl.textContent = String(msg.status || "");
-      if (ui.outputEl) {
-        if (!ui.outputEl.textContent.trim()) {
-          ui.outputEl.textContent = msg.output ? `$ ${String(msg.command || "").trim()}\n\n${msg.output}` : `$ ${String(msg.command || "").trim()}`;
-        } else if (msg.output) {
-          // Prefer the aggregated output if the stream was empty or truncated.
-          // If streaming already filled content, keep it as-is to avoid jumpiness.
-        }
-        renderTextWithLinks(ui.outputEl, ui.outputEl.textContent);
-      }
+      if (!isMessageForActiveThread(msg.threadId)) return;
+      renderThreadItem({
+        type: "commandExecution",
+        id: String(msg.itemId || ""),
+        status: String(msg.status || ""),
+        command: String(msg.command || ""),
+        aggregatedOutput: String(msg.output || "")
+      });
       if (activeCommand && activeCommand.itemId === msg.itemId) activeCommand = null;
       renderActivityIndicator();
-      scrollToBottom();
       if (pendingCommandItems > 0) pendingCommandItems--;
       scheduleMaybeClearBusy();
       return;
     }
 
     if (msg.type === "fileChangeDelta") {
-      closeCommandGroup();
-      // We can't reliably split per-file while streaming; keep a raw preview until completed.
-      const ui = ensureFileChangeUI(msg.itemId);
-      if (ui.detailsEl) ui.detailsEl.classList.add("pending");
-      if (ui.subEl && !ui.subEl.textContent) ui.subEl.textContent = "streaming…";
-      if (ui.bodyEl) {
-        let pre = ui.bodyEl.querySelector("pre.codeblock");
-        if (!pre) {
-          ui.bodyEl.textContent = "";
-          pre = document.createElement("pre");
-          pre.className = "codeblock";
-          ui.bodyEl.appendChild(pre);
-        }
-        pre.textContent += msg.delta;
-      }
       if (!activeFileChange || activeFileChange.itemId !== msg.itemId) {
         activeFileChange = { itemId: msg.itemId };
         renderActivityIndicator();
       }
-      scrollToBottom();
       return;
     }
 
     if (msg.type === "fileChangeDone") {
-      closeCommandGroup();
-      const ui = ensureFileChangeUI(msg.itemId);
-      if (ui.detailsEl) ui.detailsEl.classList.remove("pending");
-      const changes = Array.isArray(msg.changes) ? msg.changes : [];
-      if (ui.subEl) ui.subEl.textContent = `${changes.length} files`;
-      if (ui.countEl) ui.countEl.textContent = String(changes.length);
-      if (ui.bodyEl) renderFileChangesInto(ui.bodyEl, changes);
+      if (!isMessageForActiveThread(msg.threadId)) return;
+      renderThreadItem({
+        type: "fileChange",
+        id: String(msg.itemId || ""),
+        changes: Array.isArray(msg.changes) ? msg.changes : []
+      });
       if (activeFileChange && activeFileChange.itemId === msg.itemId) activeFileChange = null;
       renderActivityIndicator();
-      scrollToBottom();
       if (pendingFileItems > 0) pendingFileItems--;
       scheduleMaybeClearBusy();
       return;
@@ -2901,45 +3991,29 @@
     }
 
     if (msg.type === "diffUpdated") {
-      closeCommandGroup();
       lastTurnDiff = String(msg.diff || "");
-      const changes = parseUnifiedDiffToChanges(lastTurnDiff);
-      const ui = ensureFileChangeUI("__turn_diff__");
-      if (ui.detailsEl) ui.detailsEl.classList.add("pending");
-      if (ui.subEl) ui.subEl.textContent = `${changes.length} files`;
-      if (ui.countEl) ui.countEl.textContent = String(changes.length);
-      if (ui.bodyEl) renderFileChangesInto(ui.bodyEl, changes);
-      scrollToBottom();
       return;
     }
 
     if (msg.type === "commandExecutionStart") {
+      if (!isMessageForActiveThread(msg.threadId)) return;
       allowBusyUI = true;
       pendingSend = false;
       pendingCommandItems++;
       if (!isBusy) setBusy(true);
-      const ui = ensureCommandExecutionUI(msg.itemId);
-      if (ui.detailsEl) ui.detailsEl.classList.add("pending");
-      if (ui.previewEl) ui.previewEl.textContent = clampPreview(msg.command || "", 80);
-      if (ui.statusEl) ui.statusEl.textContent = t("runningCommand");
       activeCommand = { itemId: msg.itemId, command: String(msg.command || "") };
       renderActivityIndicator();
-      scrollToBottom();
       return;
     }
 
     if (msg.type === "fileChangeStart") {
+      if (!isMessageForActiveThread(msg.threadId)) return;
       allowBusyUI = true;
       pendingSend = false;
       pendingFileItems++;
       if (!isBusy) setBusy(true);
-      closeCommandGroup();
-      const ui = ensureFileChangeUI(msg.itemId);
-      if (ui.detailsEl) ui.detailsEl.classList.add("pending");
-      if (ui.subEl) ui.subEl.textContent = t("editingFiles");
       activeFileChange = { itemId: msg.itemId };
       renderActivityIndicator();
-      scrollToBottom();
       return;
     }
 
@@ -2950,14 +4024,17 @@
       serverBusy = Boolean(msg.busy);
       setBusy(serverBusy && allowBusyUI);
       if (!msg.busy) {
+        clearLiveAssistantRow();
+        liveAssistantPreview = null;
         activeCommand = null;
         activeFileChange = null;
         pendingAssistantItems = 0;
         pendingCommandItems = 0;
         pendingFileItems = 0;
         clearBusyToken++;
-        const ui = ensureFileChangeUI("__turn_diff__");
-        if (ui.detailsEl) ui.detailsEl.classList.remove("pending");
+        setTimeout(() => {
+          flushQueuedFollowUp(state && state.threadId ? String(state.threadId) : "");
+        }, 0);
       }
       return;
     }
@@ -2969,5 +4046,7 @@
   });
 
   applyLocale();
+  applyLockedPersonaUiState();
+  setCurrentPage("home", { skipFocus: true });
   vscode.postMessage({ type: "init" });
 })();

@@ -2,7 +2,7 @@
   "name": "nitori-codex-webview",
   "displayName": "Nitori Codex Webview",
   "description": "A lightweight Webview chat UI that talks to the local Codex app-server, with a customizable avatar.",
-  "version": "0.0.38",
+  "version": "0.0.72",
   "publisher": "kaisei-yasuzaki",
   "engines": {
     "vscode": "^1.109.0"
@@ -24,6 +24,7 @@
     "build": "node ./scripts/build.mjs",
     "watch": "node ./scripts/build.mjs --watch",
     "package": "npm run build",
+    "cleanup:installed": "powershell -ExecutionPolicy Bypass -Command \"$v=(Get-Content ./package.json | ConvertFrom-Json).version; & ./scripts/cleanup-installed-extension.ps1 -KeepVersion $v\"",
     "vscode:prepublish": "npm run build"
   },
   "activationEvents": [
@@ -75,7 +76,11 @@
       ]
     }
   },
-  "keywords": ["codex", "chat", "webview"],
+  "keywords": [
+    "codex",
+    "chat",
+    "webview"
+  ],
   "author": "kaisei-yasuzaki",
   "license": "MIT",
   "dependencies": {

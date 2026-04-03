@@ -30,6 +30,12 @@ code --install-extension kaisei-yasuzaki.nitori-codex-webview
 code --install-extension path/to/nitori-codex-webview-0.0.35.vsix
 ```
 
+If you previously installed a local/dev build of this extension and see duplicate command errors, clean old installs first:
+
+```bash
+npm run cleanup:installed
+```
+
 ## Quick start
 
 1. Ensure the `codex` CLI is installed and runnable from a terminal.
@@ -72,6 +78,12 @@ This extension is a UI wrapper around a local agent process. Actual capabilities
 ```bash
 npm install
 npm run build
+```
+
+To remove older installed copies from `~/.vscode/extensions` while keeping the current package version:
+
+```bash
+npm run cleanup:installed
 ```
 
 Press `F5` in VS Code to launch an Extension Development Host, then open `Nitori` → `Nitori Codex`.

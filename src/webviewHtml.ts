@@ -15,10 +15,12 @@ export function getWebviewHtml(webview: vscode.Webview, extensionUri: vscode.Uri
   const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, "media", "main.css"));
   const toolkitUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, "media", "toolkit.min.js"));
   const avatarUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, "media", "nitori.png"));
+  const brandUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, "media", "nitori-codex.png"));
   const backgroundUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, "media", "background.png"));
 
   const cacheBust = Date.now();
   const avatarSrc = `${avatarUri.toString()}?v=${cacheBust}`;
+  const brandSrc = `${brandUri.toString()}?v=${cacheBust}`;
   const backgroundSrc = `${backgroundUri.toString()}?v=${cacheBust}`;
 
   const csp = [
@@ -57,6 +59,7 @@ export function getWebviewHtml(webview: vscode.Webview, extensionUri: vscode.Uri
       <symbol id="ico-x" viewBox="0 0 24 24"><path fill="currentColor" d="M18.3 5.7 12 12l6.3 6.3-1.4 1.4L10.6 13.4 4.3 19.7 2.9 18.3 9.2 12 2.9 5.7 4.3 4.3l6.3 6.3 6.3-6.3 1.4 1.4Z"/></symbol>
       <symbol id="ico-send" viewBox="0 0 24 24"><path fill="currentColor" d="M2 21 23 12 2 3v7l15 2-15 2v7Z"/></symbol>
       <symbol id="ico-up" viewBox="0 0 24 24"><path fill="currentColor" d="M12 5 5 12l1.4 1.4L11 8.8V20h2V8.8l4.6 4.6L19 12l-7-7Z"/></symbol>
+      <symbol id="ico-back" viewBox="0 0 24 24"><path fill="currentColor" d="m14.7 5.3 1.4 1.4L10.8 12l5.3 5.3-1.4 1.4L8 12l6.7-6.7Z"/></symbol>
       <symbol id="ico-stop" viewBox="0 0 24 24"><path fill="currentColor" d="M7 7h10v10H7V7Z"/></symbol>
       <symbol id="ico-trash" viewBox="0 0 24 24"><path fill="currentColor" d="M9 3h6l1 2h4v2H4V5h4l1-2Zm1 6h2v10h-2V9Zm4 0h2v10h-2V9ZM7 9h2v10H7V9Zm-1-1h12l-1 13a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L6 8Z"/></symbol>
       <symbol id="ico-search" viewBox="0 0 24 24"><path fill="currentColor" d="M10 4a6 6 0 1 1 0 12a6 6 0 0 1 0-12Zm0-2a8 8 0 1 0 4.9 14.3l4.4 4.4l1.4-1.4l-4.4-4.4A8 8 0 0 0 10 2Z"/></symbol>
@@ -65,11 +68,16 @@ export function getWebviewHtml(webview: vscode.Webview, extensionUri: vscode.Uri
     <header class="topbar">
       <div class="topbar-row">
         <div class="controls">
-          <button class="task-btn" id="taskPickerButton" type="button" title="Tasks" aria-label="Open task picker">
-            <svg class="ico"><use href="#ico-list"></use></svg>
-            <span class="task-btn-text" id="taskTitle">Task</span>
-            <span class="task-btn-caret" aria-hidden="true"></span>
+          <button class="icon-btn" id="homeButton" type="button" title="Tasks" aria-label="Open task list">
+            <svg class="ico"><use id="homeButtonIconUse" href="#ico-list"></use></svg>
           </button>
+          <div class="header-copy">
+            <div class="header-title" id="taskTitle">Tasks</div>
+            <div class="header-subtitle" id="taskSubtitle">Recent tasks</div>
+          </div>
+        </div>
+        <div class="header-brand" aria-hidden="true">
+          <img class="header-brand-image" src="${brandSrc}" alt="" />
         </div>
         <div class="controls">
           <div class="status" id="status">disconnected</div>
@@ -79,36 +87,38 @@ export function getWebviewHtml(webview: vscode.Webview, extensionUri: vscode.Uri
         </div>
       </div>
 
-      <div class="task-pop" id="taskPop" hidden>
+    </header>
+
+    <div class="page page-home" id="taskPop">
+      <div class="task-pop task-page-shell">
         <div class="task-pop-search">
           <svg class="ico"><use href="#ico-search"></use></svg>
           <input id="taskSearch" type="text" placeholder="Search tasks" />
-          <button class="icon-btn" id="taskClose" type="button" title="Close" aria-label="Close">
-            <svg class="ico"><use href="#ico-x"></use></svg>
-          </button>
-        </div>
-        <div class="task-pop-filter">
-          <div class="task-pop-filter-left" id="taskListLabel">Tasks</div>
-          <button class="icon-btn" id="taskNew" type="button" title="New thread" aria-label="New thread">
-            <svg class="ico"><use href="#ico-plus"></use></svg>
-          </button>
-          <button class="icon-btn" id="taskArchive" type="button" title="Archive thread" aria-label="Archive thread">
-            <svg class="ico"><use href="#ico-archive"></use></svg>
-          </button>
         </div>
         <div class="task-pop-list" id="taskList" role="listbox" aria-label="Task list"></div>
       </div>
+    </div>
 
+    <div class="page page-chat" id="chatPage">
+      <div class="chat-empty" id="chatEmpty">
+        <img class="chat-empty-avatar" alt="avatar" src="${avatarSrc}" />
+        <div class="chat-empty-title">No task open</div>
+        <div class="chat-empty-sub">Open a task from the list, or start a new one from the home page.</div>
+      </div>
+      <main class="chat" id="chat"></main>
+    </div>
+
+    <header class="topbar topbar-settings">
       <div class="settings-pop" id="settingsPop" hidden>
         <div class="settings-grid">
           <div class="settings-group">
             <div class="settings-title" id="taskSettingsTitle">Task</div>
             <div class="settings-row">
-              <button class="icon-btn" id="newThread" title="New thread" aria-label="New thread"><svg class="ico"><use href="#ico-plus"></use></svg></button>
-              <button class="icon-btn" id="forkThread" title="Fork thread" aria-label="Fork thread"><svg class="ico"><use href="#ico-fork"></use></svg></button>
+              <button class="icon-btn" id="newThread" title="New task" aria-label="New task"><svg class="ico"><use href="#ico-plus"></use></svg></button>
+              <button class="icon-btn" id="forkThread" title="Fork task" aria-label="Fork task"><svg class="ico"><use href="#ico-fork"></use></svg></button>
               <button class="icon-btn" id="rollback1" title="Rollback one turn" aria-label="Rollback one turn"><svg class="ico"><use href="#ico-undo"></use></svg></button>
-              <button class="icon-btn" id="archiveThread" title="Archive thread" aria-label="Archive thread"><svg class="ico"><use href="#ico-archive"></use></svg></button>
-              <button class="icon-btn" id="unarchiveThread" title="Unarchive thread" aria-label="Unarchive thread"><svg class="ico"><use href="#ico-unarchive"></use></svg></button>
+              <button class="icon-btn" id="archiveThread" title="Archive task" aria-label="Archive task"><svg class="ico"><use href="#ico-archive"></use></svg></button>
+              <button class="icon-btn" id="unarchiveThread" title="Unarchive task" aria-label="Unarchive task"><svg class="ico"><use href="#ico-unarchive"></use></svg></button>
             </div>
           </div>
 
@@ -221,7 +231,7 @@ export function getWebviewHtml(webview: vscode.Webview, extensionUri: vscode.Uri
       </div>
     </header>
 
-    <main class="chat" id="chat"></main>
+    <div class="notice-stack" id="noticeStack" aria-live="polite" aria-atomic="false"></div>
 
     <div class="activity-indicator" id="activityIndicator" hidden aria-live="polite">
       <div class="activity-top">

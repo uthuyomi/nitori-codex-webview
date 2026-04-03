@@ -10,12 +10,11 @@ config*.toml
 **/*.ts
 **/*.map
 **/*.vsix
+**/*.zip
 tsconfig.json
 tmp-shiki-test.mjs
 
 # Default-exclude packaged asset folders, then opt-in only what we need.
-dist/**
-media/**
 resources/**
 
 # Keep runtime assets

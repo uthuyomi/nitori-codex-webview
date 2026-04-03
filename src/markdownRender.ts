@@ -154,6 +154,7 @@ async function createRenderer() {
         const escaped = escapeHtml(f.code);
         codeHtml = `<pre class="shiki"><code>${escaped}</code></pre>`;
       }
+      codeHtml = wrapCodeBlockHtml(codeHtml, f.code);
       const placeholder = `<div class="shiki-placeholder" data-shiki-id="${i}"></div>`;
       out = out.split(placeholder).join(codeHtml);
     }
@@ -174,3 +175,11 @@ function escapeHtml(s: string): string {
     .replace(/'/g, "&#39;");
 }
 
+function wrapCodeBlockHtml(codeHtml: string, rawCode: string): string {
+  const codeB64 = encodeBase64Utf8(rawCode);
+  return `<div class="shiki-block"><button class="shiki-copy-button" type="button" data-code-b64="${codeB64}" aria-label="Copy code">Copy</button>${codeHtml}</div>`;
+}
+
+function encodeBase64Utf8(text: string): string {
+  return Buffer.from(String(text || ""), "utf8").toString("base64");
+}
